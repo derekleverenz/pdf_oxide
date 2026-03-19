@@ -2958,9 +2958,11 @@ impl TextExtractor {
                 // Font change: merge with space between font runs
                 log::debug!(
                     "Font change word boundary: '{}' ({}) + '{}' ({}) gap={:.2}pt",
-                    &current.text[current.text.len().saturating_sub(10)..],
+                    &current.text[current
+                        .text
+                        .floor_char_boundary(current.text.len().saturating_sub(10))..],
                     current.font_name,
-                    &span.text[..span.text.len().min(10)],
+                    &span.text[..span.text.ceil_char_boundary(span.text.len().min(10))],
                     span.font_name,
                     gap
                 );
