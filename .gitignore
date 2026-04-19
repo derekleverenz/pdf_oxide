@@ -12,6 +12,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+!go/lib/**/*.so
 .Python
 build/
 develop-eggs/
@@ -20,6 +21,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!go/lib/
 lib64/
 parts/
 sdist/
@@ -194,12 +196,24 @@ pnpm-lock.yaml
 # Node modules (for WASM examples)
 node_modules/
 
+# Node native addons — always built in CI, never committed to git.
+# The js/npm/<triple>/*.node files are populated by the build-nodejs
+# job in release.yml and live only in build artifacts (#335).
+*.node
+
 # Build artifacts
 *.o
 *.a
 *.lib
 *.dll
 *.dylib
+# …but the Go binding ships prebuilt native libs committed via CI.
+# See .githooks/pre-commit for the safety net that prevents humans
+# from accidentally committing a local dev build here.
+!go/lib/**/*.so
+!go/lib/**/*.dylib
+!go/lib/**/*.dll
+!go/lib/**/*.a
 
 # Profiling
 flamegraph.svg
@@ -331,3 +345,11 @@ docs/planning/
 workdir_pdfs/
 verifications/
 debug_tools/
+
+# Cross-language benchmark fixtures (large PDFs staged locally from
+# pdf_oxide_tests; developers copy their own set into this dir)
+bench_fixtures/
+
+# .NET build artifacts
+csharp/**/bin/
+csharp/**/obj/

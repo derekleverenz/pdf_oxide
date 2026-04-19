@@ -1,9 +1,43 @@
 [workspace]
 members = [".", "pdf_oxide_mcp", "pdf_oxide_cli"]
+exclude = ["js"]
+
+# Clippy lint configuration shared by every workspace member and every target
+# (lib, bin, test, example, bench). Keeps the allow-list in a single place so
+# new bin targets don't need their own #![allow] attributes. Mirrors the stance
+# previously declared only in src/lib.rs.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+enum_variant_names = "allow"
+wrong_self_convention = "allow"
+explicit_counter_loop = "allow"
+doc_overindented_list_items = "allow"
+should_implement_trait = "allow"
+redundant_guards = "allow"
+regex_creation_in_loops = "allow"
+manual_find = "allow"
+match_like_matches_macro = "allow"
+collapsible_match = "allow"
+manual_checked_ops = "allow"
 
 [package]
 name = "pdf_oxide"
-version = "0.3.17"
+version = "0.3.35"
+# Anchor patterns with a leading slash — Cargo uses gitignore-style globs, so
+# a bare "README.md" matches every README.md recursively (was pulling in 20+
+# subdir READMEs plus js/node_modules/*/README.md into the sdist). Leading /
+# anchors to the package root.
+include = [
+    "/src/**/*",
+    "/benches/**/*",
+    "/Cargo.toml",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/README.md",
+    "/include/**/*",
+]
 edition = "2021"
 authors = ["Yury Fedoseev <yfedoseev@gmail.com>"]
 license = "MIT OR Apache-2.0"
@@ -17,7 +51,14 @@ categories = ["parsing", "text-processing"]
 
 [lib]
 name = "pdf_oxide"
-crate-type = ["cdylib", "rlib"]  # cdylib for Python/WASM, rlib for Rust
+# cdylib: Python (maturin), WASM, C# (P/Invoke), Node.js (N-API dynamic link)
+# rlib: native Rust consumers
+# staticlib: Go CGo (#334) and Node.js (#335) — produces libpdf_oxide.a for
+# self-contained binaries with no runtime LD_LIBRARY_PATH/PATH lookups
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+[lints]
+workspace = true
 
 [dependencies]
 # Core dependencies
@@ -42,8 +83,6 @@ smallvec = "1.13"  # Stack-allocated small vectors for content stream operands (
 # Compression/Decompression
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 weezl = "0.1"  # LZW compression
-inflate = "0.4"  # Alternative inflate for better error recovery
-libflate = "2.1"  # Another inflate implementation for error recovery
 brotli = "8"  # Brotli compression (PDF 2.0, ISO 32000-2:2020)
 
 # Font parsing
@@ -53,15 +92,16 @@ encoding_rs = "0.8"  # Shift-JIS, EUC-JP, and other CJK encodings for predefined
 
 # Image processing
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "tiff"] }
+jpeg-decoder = "0.3"  # Direct decoder access for CMYK JPEGs (Adobe inversion handling)
 base64 = "0.22"  # For embedding images as data URIs
 tiff = "0.11"  # TIFF support including CCITT decompression
 fax = "0.2"   # CCITT Group 3/4 decompression for scanned PDFs (more lenient with malformed EOFB)
 
 # Encryption support
-aes = "0.8"          # AES encryption for PDF 1.6+
-cbc = "0.1"          # CBC mode for AES
-md-5 = "0.10"        # MD5 for key derivation
-sha2 = "0.10"        # SHA-256 for newer encryption
+aes = "0.9"          # AES encryption for PDF 1.6+
+cbc = "0.2"          # CBC mode for AES
+md-5 = "0.11"        # MD5 for key derivation
+sha2 = "0.11"        # SHA-256 for newer encryption
 stringprep = "0.1"   # SASLprep for Unicode PDF passwords (R>=5)
 
 # Digital signatures (optional)
@@ -73,10 +113,15 @@ spki = { version = "0.7", optional = true }           # SubjectPublicKeyInfo
 pkcs1 = { version = "0.7", optional = true }          # PKCS#1 RSA format
 pkcs8 = { version = "0.10", optional = true }         # PKCS#8 private keys
 signature = { version = "2.2", optional = true }      # Signature traits
-sha1 = { version = "0.10", optional = true }          # SHA-1 for legacy signatures
+sha1 = { version = "0.11", optional = true }          # SHA-1 for legacy signatures
 
 # Parallel extraction
-rayon = { version = "1.10", optional = true }
+rayon = { version = "1.12", optional = true }
+
+# ICC colour management (Firefox's qcms, pure Rust). Default features
+# bring in `cmyk` + `iccv4-enabled` which cover every colour space PDF
+# /ICCBased streams actually use.
+qcms = { version = "0.3", optional = true }
 
 # Math and algorithms
 ndarray = { version = "0.17", optional = true, features = ["std"] }
@@ -85,7 +130,7 @@ linfa-clustering = { version = "0.8", optional = true }
 
 # ML (CPU-only)
 tract-onnx = { version = "0.22", optional = true }
-tokenizers = { version = "0.15", optional = true, default-features = false, features = ["onig"] }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 
 # OCR - PaddleOCR via ONNX Runtime (optional)
 ort = { version = "2.0.0-rc.11", optional = true, default-features = false, features = ["ndarray"] }
@@ -100,18 +145,23 @@ quick-xml = "0.39"
 
 # Python bindings (optional)
 # Using latest version to support Python 3.14+
-pyo3 = { version = "0.27", features = ["abi3-py38"], optional = true }
+pyo3 = { version = "0.28", features = ["abi3-py38", "generate-import-lib"], optional = true }
+# Bridges Rust `log` macros to Python `logging` module (issue #280)
+pyo3-log = { version = "0.13", optional = true }
 
 # WASM support (optional)
 wasm-bindgen = { version = "0.2", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["console"] }
 js-sys = { version = "0.3", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
+# Forwards Rust `log` macros to the browser console (issue #280)
+console_log = { version = "1", optional = true, features = ["color"] }
 getrandom = { version = "0.4", optional = true, features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", optional = true, features = ["js"] }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 
 # Table detection - page rendering (optional)
-pdfium-render = { version = "0.8", optional = true }
+pdfium-render = { version = "0.9", optional = true }
 
 # Rendering (optional - for page to image conversion)
 tiny-skia = { version = "0.12", optional = true }
@@ -126,25 +176,32 @@ qrcode = { version = "0.14", optional = true }
 barcoders = { version = "2.0", optional = true, features = ["image"] }
 
 # Office document conversion (optional)
-calamine = { version = "0.33", optional = true }
-zip = { version = "8.2", optional = true, default-features = false, features = ["deflate"] }
+calamine = { version = "0.34", optional = true }
+zip = { version = "8.5", optional = true, default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 criterion = "0.8"
-proptest = "1.4"
+proptest = "1.10"
 regex = "1.12"
-tempfile = "3.10"
+tempfile = "3.27"
 crc32fast = "1.3"
 wasm-bindgen-test = "0.3"
 
 [features]
-default = []
+default = ["icc"]
 
 # Enable logging for the extraction pipeline
 logging = []
 
+# Real ICC colour management via qcms (Firefox's colour engine).
+# When enabled, ICCBased colour spaces and CMYK images are converted
+# using the embedded profile instead of ISO 32000-1 §10.3.5's
+# additive-clamp fallback. Pure Rust, so WASM and C# AOT targets keep
+# working without a C toolchain dependency.
+icc = ["dep:qcms"]
+
 # Python bindings (v0.1.0)
-python = ["pyo3"]
+python = ["pyo3", "pyo3-log", "rendering", "parallel", "logging", "signatures", "barcodes", "office"]
 
 # The following features are planned for v1.0 and are not yet production-ready.
 # We define them here to avoid check-cfg warnings, but their dependencies are commented out.
@@ -152,7 +209,7 @@ ml = ["dep:tract-onnx", "dep:ndarray", "dep:linfa", "dep:linfa-clustering", "dep
 table-ml = ["ml", "dep:pdfium-render"]
 ocr = ["dep:ort", "dep:imageproc", "dep:ndarray"]
 gpu = ["dep:ort", "ml"]
-wasm = ["dep:wasm-bindgen", "dep:web-sys", "dep:js-sys", "dep:console_error_panic_hook", "dep:getrandom", "dep:serde-wasm-bindgen"]
+wasm = ["dep:wasm-bindgen", "dep:web-sys", "dep:js-sys", "dep:console_error_panic_hook", "dep:console_log", "dep:getrandom", "dep:getrandom_02", "dep:serde-wasm-bindgen", "logging", "signatures", "barcodes", "office"]
 wasm-ml = ["wasm", "ml"]
 
 # Debug feature for span merging analysis
@@ -224,6 +281,11 @@ harness = false
 [[bench]]
 name = "full_pipeline_benchmarks"
 harness = false
+
+# Cross-language benchmark runner (Rust baseline for comparing against Go/C#/JS bindings)
+[[bin]]
+name = "rust_bench"
+path = "bench/rust_bench.rs"
 
 [package.metadata.docs.rs]
 # Document with safe features only (tesseract-rs fails on docs.rs sandbox)

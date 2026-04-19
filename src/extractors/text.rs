@@ -996,6 +996,60 @@ fn should_insert_space(
 
     let geometric_suggests_space = gap_pt > geometric_threshold;
 
+    // #365 / B8b: Intra-word kerning guard (letter-letter branch).
+    //
+    // On TJ-heavy producers (LaTeX, MS Word → PDF) the Primary
+    // word-boundary detector hands `should_insert_space` two adjacent
+    // clusters like "cha"→"nge", "diffe"→"rent", "equivalen"→"t"
+    // whose gap sits just above `geometric_threshold` (= 0.5 ×
+    // space-glyph width) but well below a real word gap. The
+    // consensus rule below would then emit a spurious space mid-word.
+    // Real word gaps in real producers reach one full space-glyph
+    // width or sit next to punctuation/digits, both of which fall
+    // through this guard.
+    //
+    // The guard fires regardless of `tj_offset_triggered` because the
+    // gap can also be geometric-only (when WordBoundaryDetector splits
+    // the cluster but no explicit TJ offset crossed the threshold).
+    // See the sibling guard in `process_tj_array_tiebreaker` for the
+    // upstream space-as-span insertion path.
+    // 1.2 × full space-glyph advance. Any gap below that, between two
+    // alphabetic runs, is far more likely to be inter-letter kerning
+    // emitted by LaTeX or a Word-style exporter than a real word
+    // boundary. Real producer word gaps either match the space-glyph
+    // width plus the producer's word-spacing pad, or sit next to
+    // non-letter characters that fall through this guard.
+    //
+    // Only fires when the font is available so the threshold is
+    // computed from the font's own space-glyph advance — the no-font
+    // fallback (`font_size * 0.25`) is a wider, deliberately
+    // conservative value that already separates real word gaps from
+    // kerning at the consensus level.
+    let kerning_guard_threshold = if fonts.contains_key(font_name) {
+        Some(geometric_threshold * 2.4)
+    } else {
+        None
+    };
+    if let Some(thr) = kerning_guard_threshold {
+        if gap_pt < thr {
+            let prev_last = preceding_text.chars().last();
+            let next_first = following_text.chars().next();
+            if let (Some(pc), Some(nc)) = (prev_last, next_first) {
+                // Use is_lowercase on both sides: LaTeX/microtype intra-word kerning
+                // occurs within lowercase letter runs. Real word boundaries in
+                // professional PDFs frequently involve uppercase letters (headings,
+                // abbreviations, proper nouns) — those fall through to the consensus
+                // path, avoiding word-gluing like "APPENDIXA" or "OLIVERA.".
+                if pc.is_lowercase() && nc.is_lowercase() {
+                    log::debug!(
+                        "intra-word kerning guard: suppressing space between '{pc}' and '{nc}' (gap={gap_pt:.2}pt < {thr:.2}pt, threshold = 1.2× space-glyph width)"
+                    );
+                    return SpaceDecision::no_space(SpaceSource::NoSpace, 0.9);
+                }
+            }
+        }
+    }
+
     // Consensus checking
     // Only insert space if BOTH signals agree OR geometric signal is very strong
     // This reduces false positives in justified text where TJ offsets are arbitrary
@@ -1054,27 +1108,101 @@ fn should_insert_space(
         }
     }
 
-    // Strong geometric signal alone (gap > 2× threshold)
-    // This is high confidence even without TJ signal
-    let strong_geometric_threshold = geometric_threshold * 2.0;
-    if gap_pt > strong_geometric_threshold {
+    // Strong geometric signal alone.
+    //
+    // `geometric_threshold` is already `space_width_pt * 0.5`. A gap that
+    // clears this threshold is >= 50 % of the font's own space-glyph
+    // advance, which is what pdfium (Chrome/pypdfium2) uses as the
+    // word-break heuristic in its default text-extraction path — and
+    // the reason pdf_oxide was glueing adjacent words like
+    // "atBirmingham", "LIFESCIENCESRESEARCH", "STATIONFREEDOM",
+    // "proteincrystals" before this change. The previous 2× multiplier
+    // required gaps >= 100 % of a full space glyph, which is stricter
+    // than the gaps modern tightly-kerned typesetters emit between
+    // real words (often 60-80 % of a space glyph).
+    //
+    // Intra-word kerning and letter-spacing adjustments are well below
+    // 50 % of a space glyph (typically under 5 % of font-size), so
+    // lowering this threshold does not produce false word breaks
+    // inside words. Pure digit-digit sequences are separately protected
+    // in the value/token branch below via `digit_digit_gap_ok`.
+    //
+    // See issue #326 for the corpus-wide measurement that motivated
+    // this change (NASA Apollo 11 jaccard 0.449 → target >= 0.90 vs
+    // pypdfium2 on the 60-PDF regression corpus).
+    if gap_pt > geometric_threshold {
         log::debug!(
-            "Space decision: STRONG GEOMETRIC - gap={:.2}pt > 2×{:.2}pt threshold - inserting space",
+            "Space decision: STRONG GEOMETRIC - gap={:.2}pt > {:.2}pt threshold - inserting space",
             gap_pt,
             geometric_threshold
         );
         return SpaceDecision::insert(SpaceSource::GeometricGap, 0.95);
     }
 
+    // Separate token detection: when two spans have a positive gap and look like
+    // distinct values (not fragments of the same word), insert a space.
+    //
+    // This catches adjacent table cell values like "$0.00" "$0.00" that have small
+    // gaps (1-2pt) which fall below the standard geometric threshold but are clearly
+    // separate tokens. Word fragments within the same word have zero or near-zero
+    // gaps; any meaningful positive gap between non-fragment tokens indicates a
+    // word boundary.
+    //
+    // Heuristic: gap > 0 AND spans look like separate tokens based on boundary characters.
+    // Use near-zero threshold for currency boundaries (any positive gap = separate)
+    let min_token_gap = 0.01; // Essentially any positive gap triggers token check
+    if gap_pt > min_token_gap {
+        let prev_last = preceding_text.chars().last();
+        let next_first = following_text.chars().next();
+
+        if let (Some(pc), Some(nc)) = (prev_last, next_first) {
+            // Separate value tokens: digit/currency/punctuation boundaries that
+            // indicate two distinct values rather than fragments of one word.
+            // Examples: "$0.00" + "$0.00", "100" + "200", "Subtotal" + "$500.00"
+            let prev_is_value_end = pc.is_ascii_digit() || pc == '%' || pc == ')' || pc == ']';
+
+            // Pure digit→digit boundaries require a larger gap than the
+            // global `min_token_gap`: a long number emitted as multiple
+            // spans (e.g. due to glyph-level kerning or TJ positioning
+            // rounding) can have a tiny positive gap between adjacent
+            // digit spans, which must NOT become "123 456". Anything less
+            // than half the font-aware geometric threshold is treated as
+            // intra-number kerning, not a token boundary.
+            let digit_digit = nc.is_ascii_digit() && pc.is_ascii_digit();
+            let digit_digit_gap_ok = !digit_digit || gap_pt > geometric_threshold * 0.5;
+
+            let next_is_value_start = nc == '$'
+                || nc == '('
+                || nc == '['
+                || (nc == '-' && following_text.len() > 1)
+                || (nc.is_ascii_digit() && prev_is_value_end && digit_digit_gap_ok);
+
+            // Also detect: any text followed by currency symbol
+            // e.g., "Subtotal" + "$500.00" or "49" + "$0.00"
+            let text_then_currency = (pc.is_ascii_alphabetic() || pc.is_ascii_digit())
+                && (nc == '$' || nc == '€' || nc == '£');
+
+            if (prev_is_value_end && next_is_value_start) || text_then_currency {
+                log::debug!(
+                    "Space decision: SEPARATE VALUES - gap={:.2}pt > {:.2}pt min, prev='{}', next='{}' - inserting space",
+                    gap_pt,
+                    min_token_gap,
+                    crate::utils::safe_suffix(preceding_text, 5),
+                    crate::utils::safe_prefix(following_text, 5),
+                );
+                return SpaceDecision::insert(SpaceSource::GeometricGap, 0.85);
+            }
+        }
+    }
+
     // Default: No space
     // Per ISO 32000-1:2008 Section 9.10, when PDF doesn't encode a clear word boundary,
     // we cannot reliably recover it. Requiring consensus prevents false positives in justified text.
     log::trace!(
-        "Space decision: Insufficient consensus (TJ={}, gap={:.2}pt <= {:.2}pt, strong_threshold={:.2}pt) - no space",
+        "Space decision: Insufficient consensus (TJ={}, gap={:.2}pt <= {:.2}pt) - no space",
         tj_offset_triggered,
         gap_pt,
-        geometric_threshold,
-        strong_geometric_threshold
+        geometric_threshold
     );
     SpaceDecision::no_space(SpaceSource::NoSpace, 1.0)
 }
@@ -1285,6 +1413,10 @@ struct TjBuffer {
     font_weight: FontWeight,
     /// Pre-computed italic flag from cached font reference.
     is_italic: bool,
+    /// Whether the font is monospaced (from FixedPitch flag or name heuristic).
+    is_monospace: bool,
+    /// Per-character advance widths in text-space units (before user_h_scale).
+    char_widths: Vec<f32>,
     /// Pre-computed user-space position (CTM applied to text matrix origin).
     /// Avoids two transform_point calls per flush.
     user_pos_x: f32,
@@ -1312,6 +1444,16 @@ impl TjBuffer {
             _ => FontWeight::Normal,
         };
         let is_italic = cached_font.as_ref().map(|f| f.is_italic()).unwrap_or(false);
+        let is_monospace = cached_font.as_ref().is_some_and(|f| {
+            if f.flags.is_some_and(|flags| flags & 1 != 0) {
+                return true;
+            }
+            let name = f.base_font.to_uppercase();
+            name.contains("COURIER")
+                || name.contains("CONSOLAS")
+                || name.contains("MONO")
+                || name.contains("FIXED")
+        });
         // Pre-compute user-space position: text_matrix origin → CTM transform
         let text_pos = state.text_matrix.transform_point(0.0, 0.0);
         let user_pos = state.ctm.transform_point(text_pos.x, text_pos.y);
@@ -1329,6 +1471,8 @@ impl TjBuffer {
             effective_font_size,
             font_weight,
             is_italic,
+            is_monospace,
+            char_widths: Vec::new(),
             user_pos_x: user_pos.x,
             user_pos_y: user_pos.y,
             user_h_scale,
@@ -1356,6 +1500,28 @@ impl TjBuffer {
         // Avoids String allocation in decode_text_to_unicode (2 allocations per call).
         if let Some(font) = font {
             if font.subtype != "Type0" {
+                // #317 UTF-8-in-simple-font detection — see long comment in
+                // `append_advance_buffer`. Some producers emit UTF-8 byte
+                // sequences inside PDF string literals for fonts that only
+                // declare a Latin encoding with no ToUnicode CMap. When the
+                // entire byte slice is valid UTF-8 whose decoded chars
+                // include at least one non-Latin-1 codepoint, treat it as
+                // UTF-8 so we recover Cyrillic / Greek / CJK instead of
+                // Latin-1 mojibake.
+                if font.to_unicode.is_none() && bytes.len() >= 2 {
+                    let has_high = bytes.iter().any(|&b| b >= 0x80);
+                    if has_high {
+                        if let Ok(decoded) = std::str::from_utf8(bytes) {
+                            if decoded.chars().any(|c| c as u32 > 0xFF) {
+                                for ch in decoded.chars() {
+                                    self.unicode.push(ch);
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 let table = font.get_byte_to_char_table();
                 for &byte in bytes {
                     let c = table[byte as usize];
@@ -1850,6 +2016,24 @@ pub struct TextExtractor {
 }
 
 impl TextExtractor {
+    /// Fraction of a glyph's advance width considered "overlap" for
+    /// duplicate detection. Used by both `deduplicate_overlapping_chars`
+    /// and `deduplicate_overlapping_spans`.
+    ///
+    /// 0.30 comfortably catches real render-pass duplicates
+    /// (stroke+fill, bold shadow, outline+fill) which sit well under
+    /// 5 % of one advance apart, while staying below typical heaviest
+    /// kerning (≤ 20 % of advance) so legitimate narrow-glyph
+    /// neighbours (`ll`, `rr`, `II`, `ii`) are preserved.
+    const DEDUP_OVERLAP_RATIO: f32 = 0.30;
+
+    /// Absolute cap on the overlap window (in PDF points).
+    ///
+    /// Preserves pre-ratio v0.3.x behaviour for pathologically
+    /// oversized advance values (drop-caps, large display text) where
+    /// 30 % of the advance would swallow legitimate neighbours.
+    const DEDUP_OVERLAP_CAP_PT: f32 = 2.0;
+
     /// Create a new text extractor with default configuration.
     ///
     /// # Examples
@@ -2572,8 +2756,24 @@ impl TextExtractor {
     /// all renders are extracted. We keep only one character when multiple chars
     /// at nearly the same position exist.
     ///
-    /// Heuristic: If two consecutive characters on the same line (Y rounded to integer)
-    /// are within 2pt horizontally, keep only the first one.
+    /// Heuristic: If two consecutive characters on the same line (Y rounded to
+    /// integer) overlap by a fraction of their own advance width, keep only the
+    /// first one.
+    ///
+    /// The threshold is expressed as a fraction of the glyph's `advance_width`
+    /// (see [`Self::DEDUP_OVERLAP_RATIO`]) rather than an absolute point
+    /// value. Real rendering duplicates (stroke+fill, bold shadow,
+    /// outline+fill) sit at nearly identical positions — well under 30 % of
+    /// one advance apart. Legitimate adjacent doublets of narrow glyphs
+    /// (`ll`, `rr`, `II`, `ii` at small font sizes) are separated by one
+    /// full advance; an absolute threshold of e.g. 2 pt would wrongly
+    /// collapse them on fonts where a narrow glyph's advance drops below
+    /// ~2 pt (e.g. Helvetica at ≤ 9 pt).
+    ///
+    /// Capped at [`Self::DEDUP_OVERLAP_CAP_PT`] to preserve the existing
+    /// behaviour for pathologically oversized advance values, and falls
+    /// back to `bbox.width` when `advance_width` is missing from the font
+    /// dictionary.
     fn deduplicate_overlapping_chars(&mut self) {
         if self.chars.is_empty() {
             return;
@@ -2582,15 +2782,30 @@ impl TextExtractor {
         let mut deduplicated = Vec::with_capacity(self.chars.len());
         let mut prev_y_rounded: Option<i32> = None;
         let mut prev_x: Option<f32> = None;
+        let mut prev_char: Option<char> = None;
 
         for ch in self.chars.iter() {
             let y_rounded = ch.bbox.y.round() as i32;
             let x = ch.bbox.x;
 
             // Check if this char overlaps with the previous one
-            let should_skip = if let (Some(prev_y), Some(prev_x_val)) = (prev_y_rounded, prev_x) {
-                // Same line and within 2pt horizontally
-                y_rounded == prev_y && (x - prev_x_val).abs() < 2.0
+            let should_skip = if let (Some(prev_y), Some(prev_x_val), Some(prev_ch)) =
+                (prev_y_rounded, prev_x, prev_char)
+            {
+                // Reference width: advance_width if known, else bbox.width,
+                // else the legacy cap (keeps behaviour for pathological
+                // inputs without advance metrics).
+                let ref_width = if ch.advance_width > 0.0 {
+                    ch.advance_width
+                } else if ch.bbox.width > 0.0 {
+                    ch.bbox.width
+                } else {
+                    Self::DEDUP_OVERLAP_CAP_PT
+                };
+                let threshold =
+                    (ref_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT);
+                // Same character, same line, and within `threshold` horizontally
+                ch.char == prev_ch && y_rounded == prev_y && (x - prev_x_val).abs() < threshold
             } else {
                 false
             };
@@ -2599,6 +2814,7 @@ impl TextExtractor {
                 deduplicated.push(ch.clone());
                 prev_y_rounded = Some(y_rounded);
                 prev_x = Some(x);
+                prev_char = Some(ch.char);
             } else {
                 log::trace!(
                     "Deduplicating overlapping char '{}' at X={:.1}, Y={:.1} (too close to previous)",
@@ -2794,12 +3010,32 @@ impl TextExtractor {
     /// Deduplicate overlapping text spans on the same line.
     ///
     /// Uses hybrid geometric + content-based deduplication:
-    /// - Geometric check (same Y, X within 2pt) - catches identical positions
-    /// - Content check (same text, same line Y, different X) - catches duplicates across columns
+    /// - Geometric check (same Y, X within a fraction of the span's per-glyph
+    ///   advance) — catches identical positions
+    /// - Content check (same text, same line Y, different X) — catches
+    ///   duplicates across columns
+    ///
+    /// The geometric threshold is expressed as a fraction of the span's
+    /// per-glyph width (bbox.width / char_count), capped by
+    /// [`Self::DEDUP_OVERLAP_CAP_PT`] and scaled by
+    /// [`Self::DEDUP_OVERLAP_RATIO`]. An absolute threshold would wrongly
+    /// collapse legitimate single-glyph spans of adjacent narrow glyphs
+    /// (`ll`, `rr`, `II`, `ii` at small font sizes) in PDFs that emit text
+    /// glyph-by-glyph with kerning.
     fn deduplicate_overlapping_spans(&mut self) {
         if self.spans.is_empty() {
             return;
         }
+
+        // Phase 0 (B7): same-text overlapping spans from stroke+fill render
+        // passes. Maps (newspaper / poster) frequently draw every label
+        // twice — once stroked for outline, once filled — and both passes
+        // land at essentially the same CTM. Without this up-front filter,
+        // the merge step later concatenates them into "EverestEverest" /
+        // "CentralCentral". We bucket by lowercased text and compare each
+        // new span's bbox against prior entries via IoU; any later span
+        // whose bbox overlaps an earlier one by >= 70 % is dropped.
+        self.dedup_stroke_fill_overlap();
 
         // Take ownership of spans to avoid cloning during iteration
         let old_len = self.spans.len();
@@ -2822,7 +3058,14 @@ impl TextExtractor {
             let geometric_duplicate = if let (Some(prev_y), Some(prev_x_val), Some(ref prev_txt)) =
                 (prev_y_rounded, prev_x, &prev_text)
             {
-                y_rounded == prev_y && (x - prev_x_val).abs() < 2.0 && span.text == *prev_txt
+                // Threshold scales with the span's per-glyph advance so that
+                // single-glyph narrow spans (`l`, `r`, `I`) are never wrongly
+                // treated as overlapping with their legitimate neighbour.
+                let char_count = span.text.chars().count().max(1) as f32;
+                let per_glyph_width = (span.bbox.width / char_count).max(0.1);
+                let threshold =
+                    (per_glyph_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT);
+                y_rounded == prev_y && (x - prev_x_val).abs() < threshold && span.text == *prev_txt
             } else {
                 false
             };
@@ -2876,6 +3119,75 @@ impl TextExtractor {
         self.spans = deduplicated;
     }
 
+    /// Drop same-text spans whose bounding boxes overlap heavily with an
+    /// earlier span. This is the canonical stroke+fill pattern on maps,
+    /// posters, and marketing materials: a label is drawn twice (once
+    /// stroked for the outline, once filled for the glyph) at identical
+    /// positions. Both passes surface as distinct spans; without this
+    /// filter the downstream merge pass concatenates them.
+    ///
+    /// Keyed by lowercased text + rounded (x, y) bucket to make the
+    /// lookup O(1) without quadratic bbox comparisons on large pages.
+    /// The actual overlap check falls through to a real IoU on collision.
+    fn dedup_stroke_fill_overlap(&mut self) {
+        use std::collections::HashMap;
+
+        if self.spans.len() < 2 {
+            return;
+        }
+        let old_len = self.spans.len();
+        let spans = std::mem::take(&mut self.spans);
+        // Bucket text → list of prior bboxes. Only runs when trimmed text
+        // has ≥ 2 *characters* (not bytes) — shorter candidates (single
+        // letters, digits) rely on the downstream positional dedup already
+        // in place.
+        let mut seen: HashMap<String, Vec<crate::geometry::Rect>> = HashMap::new();
+        let mut kept: Vec<TextSpan> = Vec::with_capacity(old_len);
+        let mut skipped = 0usize;
+        for span in spans {
+            let trimmed = span.text.trim();
+            if trimmed.chars().count() < 2 {
+                kept.push(span);
+                continue;
+            }
+            let key = trimmed.to_ascii_lowercase();
+            let b = span.bbox;
+            let mut is_dup = false;
+            if let Some(existing) = seen.get(&key) {
+                for other in existing {
+                    // IoU — intersection over union. >= 0.7 means the two
+                    // bboxes are almost the same rectangle, which is what
+                    // stroke+fill produces.
+                    let ix1 = b.x.max(other.x);
+                    let iy1 = b.y.max(other.y);
+                    let ix2 = (b.x + b.width).min(other.x + other.width);
+                    let iy2 = (b.y + b.height).min(other.y + other.height);
+                    if ix2 <= ix1 || iy2 <= iy1 {
+                        continue;
+                    }
+                    let inter = (ix2 - ix1) * (iy2 - iy1);
+                    let area_a = b.width * b.height;
+                    let area_b = other.width * other.height;
+                    let union = area_a + area_b - inter;
+                    if union > 0.0 && inter / union >= 0.7 {
+                        is_dup = true;
+                        break;
+                    }
+                }
+            }
+            if is_dup {
+                skipped += 1;
+            } else {
+                seen.entry(key).or_default().push(b);
+                kept.push(span);
+            }
+        }
+        if skipped > 0 {
+            log::debug!("Stroke+fill dedup: dropped {skipped} duplicate spans of {old_len}");
+        }
+        self.spans = kept;
+    }
+
     /// Merge adjacent text spans on the same line to reconstruct complete words.
     ///
     /// PDF content streams often break words into multiple Tj operators for precise
@@ -2884,7 +3196,7 @@ impl TextExtractor {
     /// - On the same line (Y coordinates within 1pt)
     /// - Very close horizontally (gap < 3pt, approximately average char width)
     ///
-    /// This matches the behavior of industry-standard tools like PyMuPDF.
+    /// This matches the behavior of industry-standard PDF tools.
     fn merge_adjacent_spans(&mut self) {
         if self.spans.is_empty() {
             return;
@@ -2921,9 +3233,55 @@ impl TextExtractor {
             let current_end_x = current.bbox.x + current.bbox.width;
             let gap = span.bbox.x - current_end_x;
 
-            // COLUMN BOUNDARY CHECK: Don't merge spans with large gaps
-            // Use configured threshold to detect column separation
-            let large_gap_indicates_column = gap > self.merging_config.column_boundary_threshold_pt;
+            // Fallback-width correction (issue #328): When the previous
+            // span's font has no explicit `/Widths` array, every glyph in
+            // that span reports the 500/550/600-thousandths-of-em fallback
+            // from `FontInfo::new`. For proportional Latin fonts whose
+            // real glyphs are narrower than that fallback (`SR` in the
+            // NASA Apollo report is a concrete example), the span's
+            // `bbox.width` is systematically inflated and `current_end_x`
+            // overshoots the actual end of the rendered text — often by
+            // enough to swallow the real inter-word gap entirely, turning
+            // the visible word boundary into a negative `gap` value and
+            // tripping merge logic that then glues the words without a
+            // space.
+            //
+            // `space_gap` is a corrected gap value used ONLY for the
+            // space-insertion decision below. The original `gap` is left
+            // unchanged so the merge-vs-column decision, the decimal-merge
+            // heuristic, and any downstream branch that reasons about the
+            // actual bbox layout still see the real layout and don't
+            // suddenly reclassify legitimate adjacent words as column
+            // boundaries. In other words: the merge still happens exactly
+            // as before on fallback-width fonts, but once we're inside the
+            // merge branch we consult a more honest gap to decide whether
+            // a space is warranted.
+            let space_gap = {
+                let prev_font = self.fonts.get(&current.font_name);
+                let reliable = prev_font.map(|f| f.has_explicit_widths()).unwrap_or(true);
+                if !reliable && current.bbox.width > 0.0 && !current.text.is_empty() {
+                    // 0.55 / 0.45 ≈ 1.22 matches the per-glyph inflation
+                    // observed on the NASA Apollo corpus (subagent analysis
+                    // in issue #328). Keeping the correction modest avoids
+                    // over-reporting gaps on fonts where 0.55 em is actually
+                    // the correct average advance.
+                    let corrected_end_x = current.bbox.x + current.bbox.width / 1.22;
+                    span.bbox.x - corrected_end_x
+                } else {
+                    gap
+                }
+            };
+
+            // Column-boundary gap, font-size-aware. The same 6pt gap is
+            // a column gutter at 11pt body text but normal word kerning
+            // at a 36pt title; use 0.5em as a floor above the configured
+            // absolute threshold.
+            let font_size_ref = current.font_size.max(span.font_size);
+            let column_threshold = self
+                .merging_config
+                .column_boundary_threshold_pt
+                .max(font_size_ref * 0.5);
+            let large_gap_indicates_column = gap > column_threshold;
 
             // SPLIT BOUNDARY CHECK: Respect boundaries from CamelCase splitting
             // If a span has split_boundary_before=true, it represents a word boundary
@@ -2931,53 +3289,82 @@ impl TextExtractor {
             // These should always be merged WITH a space, never without.
             let has_split_boundary = span.split_boundary_before;
 
-            // Font-change word boundary: when font name changes between
-            // adjacent spans on the same line, treat as a word boundary signal.
-            // Font changes mid-word are extremely rare in well-formed PDFs;
-            // font switches (e.g., regular→italic for product names) at word
-            // boundaries are the norm in LaTeX and other typesetting systems.
-            // Allow small negative gaps (overlaps up to 2pt) since span width
-            // computation may slightly overestimate, causing minor overlaps at
-            // font transitions even when visually there is whitespace.
-            let font_change_merge = same_line
-                && gap > -2.0
-                && gap < 3.0
-                && current.font_name != span.font_name
-                && !span.text.chars().all(|c| c.is_whitespace());
+            // Font identity: same base font AND same size AND same styling.
+            let is_same_font = current.font_name == span.font_name
+                && (current.font_size - span.font_size).abs() < 0.01
+                && current.font_weight == span.font_weight
+                && current.is_italic == span.is_italic;
+
+            // Cross-font word glue: same-baseline spans in different
+            // fonts/weights, tight gap (<0.25em), both sides alphabetic,
+            // and one side is a single character. Targets the drop-cap /
+            // single-letter-small-caps typography pattern where per-
+            // letter emphasis runs would corrupt proper nouns.
+            let cross_font_word_glue = !is_same_font
+                && same_line
+                && gap > -1.0
+                && gap < font_size_ref * 0.25
+                && !current.text.is_empty()
+                && !span.text.is_empty()
+                && current
+                    .text
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_alphabetic())
+                && span.text.chars().next().is_some_and(|c| c.is_alphabetic())
+                && (current.text.chars().count() == 1 || span.text.chars().count() == 1);
 
             // Merge threshold: Use configured values
             // Negative gaps: use severe_overlap_threshold_pt (default -0.5pt)
-            // Positive gaps: use 3pt default (0.25em * 12pt)
-            // However, if split_boundary_before=true, ALWAYS merge but insert space
-            let should_merge = same_line
-                && (self.merging_config.severe_overlap_threshold_pt..3.0).contains(&gap)
-                && !large_gap_indicates_column
-                || (same_line && has_split_boundary);
+            // Positive gaps: use a threshold that allows for justified text but
+            // avoids merging across clear column boundaries.
+            // Same-font spans are merged more aggressively to reconstruct words.
+            let merge_threshold_pt = if is_same_font {
+                column_threshold.max(3.0)
+            } else {
+                // Different fonts: only merge if they are effectively overlapping
+                // to handle minor kerning/rounding issues, but generally keep separate.
+                0.5
+            };
 
-            if font_change_merge {
-                // Font change: merge with space between font runs
+            let should_merge = same_line
+                && is_same_font
+                && (self.merging_config.severe_overlap_threshold_pt..merge_threshold_pt)
+                    .contains(&gap)
+                && !large_gap_indicates_column
+                || (same_line && has_split_boundary)
+                || cross_font_word_glue;
+
+            // DECIMAL VALUE MERGE: Some forms place integer and decimal parts
+            // of dollar amounts in separate fixed-width boxes.
+            // e.g., "123456" (integer box) + "72" (cents box) with ~10pt gap.
+            // Detect this pattern: both spans are pure digits, the second is
+            // exactly 1-2 digits (cents), same line, and gap < 2x font size.
+            let decimal_merge = same_line
+                && gap > 0.0
+                && gap < current.font_size * 2.0
+                && !current.text.is_empty()
+                && !span.text.is_empty()
+                && current.text.chars().all(|c| c.is_ascii_digit())
+                && span.text.chars().all(|c| c.is_ascii_digit())
+                && (1..=2).contains(&span.text.len());
+
+            if decimal_merge {
+                // Join integer and decimal parts with "."
                 log::debug!(
-                    "Font change word boundary: '{}' ({}) + '{}' ({}) gap={:.2}pt",
-                    &current.text[current.text.len().saturating_sub(10)..],
-                    current.font_name,
-                    &span.text[..span.text.len().min(10)],
-                    span.font_name,
+                    "Decimal value merge: '{}' + '{}' -> '{}.{}' (gap={:.1}pt)",
+                    current.text,
+                    span.text,
+                    current.text,
+                    span.text,
                     gap
                 );
-                // Insert space unless next span starts with punctuation
-                // (e.g., "Docling" + "," should NOT become "Docling ,")
-                let starts_with_punct = span.text.starts_with(|c: char| {
-                    matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"')
-                });
-                if !current.text.ends_with(' ') && !span.text.starts_with(' ') && !starts_with_punct
-                {
-                    current.text.push(' ');
-                }
+                current.text.push('.');
                 current.text.push_str(&span.text);
-                // Update font_name to the merged span's font so that subsequent
-                // font transitions (e.g., italic→regular for "[2]" after "PyTorch")
-                // are detected as font changes.
-                current.font_name = span.font_name.clone();
+            } else if cross_font_word_glue {
+                // Mid-word font/weight change: concatenate without any space
+                // or space-heuristic — these are same-word character runs.
+                current.text.push_str(&span.text);
             } else if should_merge {
                 // PHASE 1 FIX: Check if next span is entirely whitespace-only OR marked as offset_semantic space
                 // If either is true, never insert an additional space - just concatenate directly
@@ -3000,7 +3387,7 @@ impl TextExtractor {
                     let space_decision = should_insert_space(
                         &current.text,
                         &span.text,
-                        gap,
+                        space_gap,
                         current.font_size,
                         &current.font_name,
                         &self.fonts,
@@ -3056,13 +3443,27 @@ impl TextExtractor {
                 }
             }
 
-            if font_change_merge || should_merge {
+            if decimal_merge || should_merge || cross_font_word_glue {
                 // Extend bounding box to include both spans
                 let new_width = (span.bbox.x + span.bbox.width) - current.bbox.x;
                 let new_height = current.bbox.height.max(span.bbox.height);
 
                 current.bbox.width = new_width;
                 current.bbox.height = new_height;
+
+                // After a cross-font glue, adopt the longer run's font
+                // metadata. The single-letter side was typographic
+                // decoration, not semantic emphasis, so the dominant-run
+                // style should win.
+                if cross_font_word_glue {
+                    let span_chars = span.text.chars().count();
+                    let current_chars_before = current.text.chars().count() - span_chars;
+                    if span_chars > current_chars_before {
+                        current.font_name = span.font_name.clone();
+                        current.font_weight = span.font_weight;
+                        current.is_italic = span.is_italic;
+                    }
+                }
 
                 log::trace!(
                     "Merged span: appended '{}' (gap={:.1}pt, now {} chars)",
@@ -3350,8 +3751,12 @@ impl TextExtractor {
                 // Flush Tj buffer before changing text position
                 self.flush_tj_span_buffer()?;
                 let state = self.state_stack.current_mut();
+                // Per ISO 32000-1:2008 §9.4.2, Table 108:
+                // Tlm_new = T(tx,ty) × Tlm_old
+                // The translation is in text-line space, so it must be
+                // pre-multiplied to be scaled by the existing Tlm transform.
                 let tm = Matrix::translation(tx, ty);
-                state.text_line_matrix = state.text_line_matrix.multiply(&tm);
+                state.text_line_matrix = tm.multiply(&state.text_line_matrix);
                 state.text_matrix = state.text_line_matrix;
             },
             Operator::TD { tx, ty } => {
@@ -3361,8 +3766,9 @@ impl TextExtractor {
                 // TD is like Td but also sets leading
                 let state = self.state_stack.current_mut();
                 state.leading = -ty;
+                // Per ISO 32000-1:2008 §9.4.2: Tlm_new = T(tx,ty) × Tlm_old
                 let tm = Matrix::translation(tx, ty);
-                state.text_line_matrix = state.text_line_matrix.multiply(&tm);
+                state.text_line_matrix = tm.multiply(&state.text_line_matrix);
                 state.text_matrix = state.text_line_matrix;
             },
             Operator::TStar => {
@@ -3372,8 +3778,9 @@ impl TextExtractor {
                 // Move to start of next line (using leading)
                 let leading = self.state_stack.current().leading;
                 let state = self.state_stack.current_mut();
+                // Per ISO 32000-1:2008 §9.4.2: Tlm_new = T(0,-TL) × Tlm_old
                 let tm = Matrix::translation(0.0, -leading);
-                state.text_line_matrix = state.text_line_matrix.multiply(&tm);
+                state.text_line_matrix = tm.multiply(&state.text_line_matrix);
                 state.text_matrix = state.text_line_matrix;
             },
 
@@ -3582,6 +3989,7 @@ impl TextExtractor {
                                             color: Color::new(r, g, b),
                                             mcid: self.current_mcid,
                                             is_italic: is_italic_space,
+                                            is_monospace: false,
                                             // Transformation properties (v0.3.1)
                                             origin_x: pos.x,
                                             origin_y: pos.y,
@@ -3600,7 +4008,9 @@ impl TextExtractor {
                                     }
 
                                     let state_mut = self.state_stack.current_mut();
-                                    state_mut.text_matrix.e += tx;
+                                    let tm = state_mut.text_matrix;
+                                    state_mut.text_matrix.e += tx * tm.a;
+                                    state_mut.text_matrix.f += tx * tm.b;
                                 },
                             }
                         }
@@ -3615,8 +4025,9 @@ impl TextExtractor {
                 let leading = self.state_stack.current().leading;
                 {
                     let state = self.state_stack.current_mut();
+                    // Per ISO 32000-1:2008 §9.4.2: Tlm_new = T(0,-TL) × Tlm_old
                     let tm = Matrix::translation(0.0, -leading);
-                    state.text_line_matrix = state.text_line_matrix.multiply(&tm);
+                    state.text_line_matrix = tm.multiply(&state.text_line_matrix);
                     state.text_matrix = state.text_line_matrix;
                 }
 
@@ -3647,8 +4058,9 @@ impl TextExtractor {
                     state.word_space = word_space;
                     state.char_space = char_space;
                     let leading = state.leading;
+                    // Per ISO 32000-1:2008 §9.4.2: Tlm_new = T(0,-TL) × Tlm_old
                     let tm = Matrix::translation(0.0, -leading);
-                    state.text_line_matrix = state.text_line_matrix.multiply(&tm);
+                    state.text_line_matrix = tm.multiply(&state.text_line_matrix);
                     state.text_matrix = state.text_line_matrix;
                 }
 
@@ -4307,13 +4719,9 @@ impl TextExtractor {
     /// graphics (charts, plots) with no text content.
     const MAX_XOBJECT_DEPTH: u32 = 10;
 
-    /// Maximum number of XObject streams decoded per page. Pages with thousands
-    /// of Form XObjects (e.g., matplotlib plots) cause O(n) decompression overhead.
-    /// Real text content rarely requires more than ~100 XObject decodes.
     const MAX_XOBJECT_DECODES: u32 = 500;
 
     /// Resolve XObject name to ObjectRef using cached mapping.
-    /// Builds the cache on first call for the current resources context.
     fn resolve_xobject_ref(&mut self, name: &str) -> Result<Option<ObjectRef>> {
         // Check cache first (O(1) lookup)
         if let Some(cached) = self.cached_xobject_refs.get(name) {
@@ -4370,11 +4778,7 @@ impl TextExtractor {
         Ok(self.cached_xobject_refs.get(name).copied().flatten())
     }
 
-    /// Process a Form XObject invoked by the Do operator.
-    ///
-    /// This extracts text from Form XObjects while avoiding duplicate processing.
     fn process_xobject(&mut self, name: &str) -> Result<()> {
-        // Budget checks: avoid pathological cases with thousands of XObjects
         if self.xobject_depth >= Self::MAX_XOBJECT_DEPTH {
             return Ok(());
         }
@@ -4403,6 +4807,15 @@ impl TextExtractor {
             None => return Ok(()),
         };
 
+        if doc
+            .xobject_text_free_cache
+            .lock()
+            .unwrap()
+            .contains(&xobject_ref)
+        {
+            return Ok(());
+        }
+
         // Quick Subtype check: skip Image XObjects without loading the full object.
         // Image XObjects can be megabytes of compressed pixel data — loading them
         // just to discover Subtype=Image is a major bottleneck (10-15ms per image).
@@ -4410,16 +4823,29 @@ impl TextExtractor {
             return Ok(());
         }
 
-        // Document-level cache: skip Form XObjects already known to contain no text.
-        // Avoids repeated decompression of shared graphics-only XObjects across pages.
-        if doc.xobject_text_free_cache.borrow().contains(&xobject_ref) {
-            return Ok(());
-        }
-
         // Span result cache: reuse extracted spans from self-contained Form XObjects.
-        // Only works for XObjects with own /Resources (font context is self-contained).
-        if self.extract_spans {
-            let cached_spans = { doc.xobject_spans_cache.borrow().get(&xobject_ref).cloned() };
+        //
+        // Spans are stored in CTM-transformed page coordinates, so the cache is
+        // only correct when the caller's CTM matches the one at first extraction.
+        // Issue B1 (nougat_005.pdf): a single Form XObject carries every page's
+        // content, and each page's content stream applies a different CTM
+        // translation to position its viewport into that XObject. Reusing the
+        // cached spans returned page 0's coordinates on every page, so every
+        // page emitted identical cross-page text.
+        //
+        // Safe path: only hit the cache when the current CTM is identity. That
+        // covers the common case (reusable headers/footers stamped at the same
+        // origin) without mixing coordinate systems. For non-identity CTMs we
+        // fall through to the fresh extraction below, which applies the caller's
+        // CTM to each span.
+        if self.extract_spans && self.state_stack.current().ctm.is_identity() {
+            let cached_spans = {
+                doc.xobject_spans_cache
+                    .lock()
+                    .unwrap()
+                    .get(&xobject_ref)
+                    .cloned()
+            };
             if let Some(cached_spans) = cached_spans {
                 if let Some(spans) = cached_spans {
                     self.spans.extend(spans.iter().cloned());
@@ -4467,7 +4893,10 @@ impl TextExtractor {
                                     "Skipping Form XObject '{}': no Font/XObject in Resources",
                                     name
                                 );
-                                doc.xobject_text_free_cache.borrow_mut().insert(xobject_ref);
+                                doc.xobject_text_free_cache
+                                    .lock()
+                                    .unwrap()
+                                    .insert(xobject_ref);
                                 return Ok(());
                             }
                         }
@@ -4482,8 +4911,13 @@ impl TextExtractor {
 
                 // Decode the stream — check cache first to avoid repeated FlateDecode.
                 self.xobject_decode_count += 1;
-                let cached_stream =
-                    { doc.xobject_stream_cache.borrow().get(&xobject_ref).cloned() };
+                let cached_stream = {
+                    doc.xobject_stream_cache
+                        .lock()
+                        .unwrap()
+                        .get(&xobject_ref)
+                        .cloned()
+                };
                 let stream_data = if let Some(cached) = cached_stream {
                     cached.as_ref().clone()
                 } else {
@@ -4491,13 +4925,17 @@ impl TextExtractor {
                         Ok(data) => {
                             // Cache if under 50MB total
                             const MAX_STREAM_CACHE_BYTES: usize = 50 * 1024 * 1024;
-                            if doc.xobject_stream_cache_bytes.get() + data.len()
-                                <= MAX_STREAM_CACHE_BYTES
-                            {
-                                doc.xobject_stream_cache_bytes
-                                    .set(doc.xobject_stream_cache_bytes.get() + data.len());
+                            let current = doc
+                                .xobject_stream_cache_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if current + data.len() <= MAX_STREAM_CACHE_BYTES {
+                                doc.xobject_stream_cache_bytes.store(
+                                    current + data.len(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 doc.xobject_stream_cache
-                                    .borrow_mut()
+                                    .lock()
+                                    .unwrap()
                                     .insert(xobject_ref, std::sync::Arc::new(data.clone()));
                             }
                             data
@@ -4513,18 +4951,45 @@ impl TextExtractor {
                     }
                 };
 
-                // Quick scan: skip XObjects that contain no text operators (BT) and
-                // no nested XObject invocations (Do). This avoids expensive font loading
-                // and content stream parsing for pure vector-graphics Form XObjects.
                 if !crate::document::PdfDocument::may_contain_text(&stream_data) {
                     log::debug!(
                         "Skipping text-free Form XObject '{}' ({} bytes)",
                         name,
                         stream_data.len()
                     );
-                    doc.xobject_text_free_cache.borrow_mut().insert(xobject_ref);
+                    doc.xobject_text_free_cache
+                        .lock()
+                        .unwrap()
+                        .insert(xobject_ref);
                     return Ok(());
                 }
+
+                // Parse /Matrix from Form XObject dict (default: identity per ISO 32000-1 §8.10.1)
+                let form_matrix = if let Some(Object::Array(arr)) = xobject_dict.get("Matrix") {
+                    let get_f32 = |i: usize| -> f32 {
+                        match arr.get(i) {
+                            Some(Object::Real(v)) => *v as f32,
+                            Some(Object::Integer(v)) => *v as f32,
+                            _ => {
+                                if i == 0 || i == 3 {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            },
+                        }
+                    };
+                    Matrix {
+                        a: get_f32(0),
+                        b: get_f32(1),
+                        c: get_f32(2),
+                        d: get_f32(3),
+                        e: get_f32(4),
+                        f: get_f32(5),
+                    }
+                } else {
+                    Matrix::identity()
+                };
 
                 // Only save/restore fonts+resources when XObject has its own Resources.
                 // Avoids expensive HashMap clone for XObjects that inherit page fonts.
@@ -4571,6 +5036,13 @@ impl TextExtractor {
                 // Track span count for result caching
                 let spans_before = self.spans.len();
 
+                // Save graphics state (implicit q per ISO 32000-1 §8.10.1)
+                self.state_stack.save();
+
+                // Concatenate Form XObject /Matrix with CTM
+                let state = self.state_stack.current_mut();
+                state.ctm = form_matrix.multiply(&state.ctm);
+
                 // Streaming parse+execute: avoids allocating Vec<Operator>
                 self.xobject_depth += 1;
                 let parse_result =
@@ -4584,18 +5056,42 @@ impl TextExtractor {
                     );
                 }
 
-                // Cache span results for self-contained Form XObjects.
-                // Only safe when XObject has own /Resources (font context is independent of page).
-                if has_own_resources && self.extract_spans {
+                // Cache span results for self-contained Form XObjects. Only
+                // safe when the XObject has its own /Resources (font context
+                // is page-independent) AND the current CTM is identity —
+                // otherwise the stored spans are in caller-specific page
+                // coordinates and would poison identity-CTM hits on other
+                // pages (see issue B1).
+                //
+                // Note: is_identity() is checked AFTER the XObject's
+                // /Matrix is concatenated, so XObjects with their own
+                // /Matrix never cache even when the caller CTM is identity.
+                // That's conservative-safe at the cost of re-extraction;
+                // storing spans in XObject-local coords would fix this but
+                // the complexity isn't justified by the current benchmark.
+                let save_identity_ctm = self.state_stack.current().ctm.is_identity();
+                if has_own_resources && self.extract_spans && save_identity_ctm {
                     let new_spans = if self.spans.len() > spans_before {
                         Some(self.spans[spans_before..].to_vec())
                     } else {
                         None
                     };
                     doc.xobject_spans_cache
-                        .borrow_mut()
+                        .lock()
+                        .unwrap()
                         .insert(xobject_ref, new_spans);
                 }
+
+                // Restore graphics state (implicit Q per ISO 32000-1 §8.10.1)
+                self.state_stack.restore();
+                // Sync cached font with restored state
+                self.cached_current_font = self
+                    .state_stack
+                    .current()
+                    .font_name
+                    .as_ref()
+                    .and_then(|name| self.fonts.get(name))
+                    .cloned();
 
                 // Restore fonts, resources, and XObject cache only if saved
                 if let Some(fonts) = saved_fonts {
@@ -4703,8 +5199,17 @@ impl TextExtractor {
             word_spacing: buffer.word_space, // Tw - captured from PDF content stream
             horizontal_scaling: buffer.horizontal_scaling, // Tz - captured from PDF content stream
             is_italic: is_italic_span,
+            is_monospace: buffer.is_monospace,
             primary_detected: false,
             artifact_type: self.current_artifact_type(),
+            char_widths: {
+                let mut cw = std::mem::take(&mut buffer.char_widths);
+                let h = buffer.user_h_scale;
+                for w in &mut cw {
+                    *w *= h;
+                }
+                cw
+            },
         };
         self.span_sequence_counter += 1;
 
@@ -4838,6 +5343,18 @@ impl TextExtractor {
                     // Use geometry-based adaptive threshold
                     let threshold = self.calculate_adaptive_tj_threshold();
                     if *offset < threshold {
+                        // Note: #365 split-word symptoms ("diffe rent", "cha nge",
+                        // "equivalen t") are handled at the higher level by the
+                        // intra-word kerning guard in `should_insert_space`. An
+                        // earlier TJ-side guard here (commit b2c6484) used a
+                        // letter-letter + |offset| < space-glyph-width rule, but
+                        // that rule misclassified real inter-word gaps in
+                        // tightly-justified PDFs (LaTeX academic papers, Docling
+                        // output) where producers encode word boundaries as TJ
+                        // offsets smaller than a full space glyph. The
+                        // span-merge-time guard has more context (full bbox,
+                        // WordBoundaryDetector) and avoids that false positive.
+                        //
                         // Check if buffer ends with space BEFORE flushing
                         // This prevents double spaces when TJ processor inserts space
                         // AND span merging would insert space at the same boundary.
@@ -5136,8 +5653,10 @@ impl TextExtractor {
             word_spacing: state.word_space,
             horizontal_scaling: state.horizontal_scaling,
             is_italic,
+            is_monospace: false,
             primary_detected: true,
             artifact_type: None,
+            char_widths: vec![],
         };
 
         // Step 6: Increment sequence counter and add to spans
@@ -5325,12 +5844,12 @@ impl TextExtractor {
             w_sum
         };
 
-        // Update text matrix position
+        // Update text matrix position per ISO 32000-1:2008 §9.4.4:
+        // Tm_new = [1 0 0 1 tx 0] × Tm_old, where tx = total_width (text-space displacement)
         let state = self.state_stack.current_mut();
         let text_matrix = state.text_matrix;
-        let advance = total_width / text_matrix.d.abs();
-        state.text_matrix.e += advance * text_matrix.a;
-        state.text_matrix.f += advance * text_matrix.b;
+        state.text_matrix.e += total_width * text_matrix.a;
+        state.text_matrix.f += total_width * text_matrix.b;
 
         Ok(total_width)
     }
@@ -5366,12 +5885,56 @@ impl TextExtractor {
 
         let total_width = if let Some(font) = font {
             if font.subtype != "Type0" {
+                // #317: UTF-8-in-simple-font detection (same heuristic as
+                // `append_advance_buffer`). Some producers emit raw UTF-8
+                // bytes inside PDF string literals when the font declares
+                // only a Latin encoding and no ToUnicode CMap. Byte-by-byte
+                // Latin decoding produces mojibake. When the slice is valid
+                // UTF-8 with at least one non-Latin-1 codepoint, decode as
+                // UTF-8 so non-Latin scripts (Cyrillic, Greek, CJK, …) come
+                // through as their intended codepoints.
+                if font.to_unicode.is_none() && text.len() >= 2 {
+                    let has_high = text.iter().any(|&b| b >= 0x80);
+                    if has_high {
+                        if let Ok(decoded) = std::str::from_utf8(text) {
+                            if decoded.chars().any(|c| c as u32 > 0xFF) {
+                                let width_table = font.get_byte_to_width_table();
+                                let mut w_sum = 0.0f32;
+                                for &byte in text {
+                                    let mut w = width_table[byte as usize] * fs_factor * hs_factor;
+                                    w += cs_hs;
+                                    if byte == 0x20 {
+                                        w += ws_hs;
+                                    }
+                                    w_sum += w;
+                                }
+                                let char_count = decoded.chars().count();
+                                if char_count > 0 {
+                                    let per_char = w_sum / char_count as f32;
+                                    for ch in decoded.chars() {
+                                        buffer.unicode.push(ch);
+                                        buffer.char_widths.push(per_char);
+                                    }
+                                }
+                                // Fall through to the matrix update at the
+                                // bottom of the function via `w_sum`.
+                                let state = self.state_stack.current_mut();
+                                let text_matrix = state.text_matrix;
+                                state.text_matrix.e += w_sum * text_matrix.a;
+                                state.text_matrix.f += w_sum * text_matrix.b;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 // Fast path: single pass over bytes for both Unicode and width
                 let char_table = font.get_byte_to_char_table();
                 let width_table = font.get_byte_to_width_table();
                 let mut w_sum = 0.0f32;
                 for &byte in text {
-                    // Unicode decode
+                    // Unicode decode — count chars added for per-char width tracking
+                    let len_before = buffer.unicode.len();
                     let c = char_table[byte as usize];
                     if c != '\0' {
                         buffer.unicode.push(c);
@@ -5403,6 +5966,16 @@ impl TextExtractor {
                         w += ws_hs;
                     }
                     w_sum += w;
+                    // Track per-character advance widths
+                    let chars_added = buffer.unicode.len() - len_before;
+                    if chars_added == 1 {
+                        buffer.char_widths.push(w);
+                    } else if chars_added > 1 {
+                        let per_char = w / chars_added as f32;
+                        for _ in 0..chars_added {
+                            buffer.char_widths.push(per_char);
+                        }
+                    }
                 }
                 w_sum
             } else {
@@ -5417,6 +5990,7 @@ impl TextExtractor {
                         w += ws_hs;
                     }
                     w_sum += w;
+                    buffer.char_widths.push(w);
                 }
                 w_sum
             }
@@ -5427,19 +6001,20 @@ impl TextExtractor {
             let space_w = default_w + ws_hs;
             let mut w_sum = 0.0f32;
             for &byte in text {
-                w_sum += if byte == 0x20 { space_w } else { default_w };
+                let w = if byte == 0x20 { space_w } else { default_w };
+                w_sum += w;
+                buffer.char_widths.push(w);
             }
             w_sum
         };
 
         buffer.accumulated_width += total_width;
 
-        // Update text matrix position
+        // Update text matrix position per ISO 32000-1:2008 §9.4.4
         let state = self.state_stack.current_mut();
         let text_matrix = state.text_matrix;
-        let advance = total_width / text_matrix.d.abs();
-        state.text_matrix.e += advance * text_matrix.a;
-        state.text_matrix.f += advance * text_matrix.b;
+        state.text_matrix.e += total_width * text_matrix.a;
+        state.text_matrix.f += total_width * text_matrix.b;
 
         Ok(())
     }
@@ -5469,10 +6044,79 @@ impl TextExtractor {
 
         let total_width = if let Some(font) = font {
             if font.subtype != "Type0" {
+                // #317: UTF-8-in-simple-font detection.
+                //
+                // Some producers (Russian CAD exporters, MS Office via
+                // non-English locales) emit UTF-8 byte sequences inside PDF
+                // string literals for a font that only declares a Latin
+                // encoding (WinAnsi, StandardEncoding, MacRoman) and no
+                // ToUnicode CMap. Byte-by-byte decoding through the Latin
+                // encoding produces mojibake like `ÐÐ¸ÑÑ` for "Лист".
+                //
+                // Heuristic: when the font has no ToUnicode and the entire
+                // text slice is a valid UTF-8 sequence whose decoded
+                // codepoints contain at least one non-Latin-1 character
+                // (U+0100 and above), treat the slice as UTF-8 directly.
+                // The non-Latin-1 gate prevents mis-interpreting genuine
+                // Latin-1 Supplement content (`Résumé`, etc.) — those
+                // decode entirely into U+0000..U+00FF and are left alone.
+                let utf8_width: Option<f32> = if font.to_unicode.is_none() && text.len() >= 2 {
+                    let has_high = text.iter().any(|&b| b >= 0x80);
+                    if has_high {
+                        if let Ok(decoded) = std::str::from_utf8(text) {
+                            let has_non_latin1 = decoded.chars().any(|c| c as u32 > 0xFF);
+                            if has_non_latin1 {
+                                let width_table = font.get_byte_to_width_table();
+                                let mut w_sum = 0.0f32;
+                                for &byte in text {
+                                    let mut w = width_table[byte as usize] * fs_factor * hs_factor;
+                                    w += cs_hs;
+                                    if byte == 0x20 {
+                                        w += ws_hs;
+                                    }
+                                    w_sum += w;
+                                }
+                                let char_count = decoded.chars().count();
+                                if char_count > 0 {
+                                    let per_char = w_sum / char_count as f32;
+                                    for ch in decoded.chars() {
+                                        buffer.unicode.push(ch);
+                                        buffer.char_widths.push(per_char);
+                                    }
+                                }
+                                log::debug!(
+                                    "UTF-8 mojibake repair: decoded {} Latin-1 bytes as {} chars via UTF-8 in font '{}'",
+                                    text.len(),
+                                    char_count,
+                                    font.base_font
+                                );
+                                Some(w_sum)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(w) = utf8_width {
+                    buffer.accumulated_width += w;
+                    let state = self.state_stack.current_mut();
+                    let text_matrix = state.text_matrix;
+                    state.text_matrix.e += w * text_matrix.a;
+                    state.text_matrix.f += w * text_matrix.b;
+                    return Ok(());
+                }
+
                 let char_table = font.get_byte_to_char_table();
                 let width_table = font.get_byte_to_width_table();
                 let mut w_sum = 0.0f32;
                 for &byte in text {
+                    let len_before = buffer.unicode.len();
                     let c = char_table[byte as usize];
                     if c != '\0' {
                         buffer.unicode.push(c);
@@ -5500,6 +6144,15 @@ impl TextExtractor {
                         w += ws_hs;
                     }
                     w_sum += w;
+                    let chars_added = buffer.unicode.len() - len_before;
+                    if chars_added == 1 {
+                        buffer.char_widths.push(w);
+                    } else if chars_added > 1 {
+                        let per_char = w / chars_added as f32;
+                        for _ in 0..chars_added {
+                            buffer.char_widths.push(per_char);
+                        }
+                    }
                 }
                 w_sum
             } else {
@@ -5518,6 +6171,7 @@ impl TextExtractor {
                         w += ws_hs;
                     }
                     w_sum += w;
+                    buffer.char_widths.push(w);
                 }
                 w_sum
             }
@@ -5527,7 +6181,9 @@ impl TextExtractor {
             let space_w = default_w + ws_hs;
             let mut w_sum = 0.0f32;
             for &byte in text {
-                w_sum += if byte == 0x20 { space_w } else { default_w };
+                let w = if byte == 0x20 { space_w } else { default_w };
+                w_sum += w;
+                buffer.char_widths.push(w);
             }
             w_sum
         };
@@ -5536,9 +6192,8 @@ impl TextExtractor {
 
         let state = self.state_stack.current_mut();
         let text_matrix = state.text_matrix;
-        let advance = total_width / text_matrix.d.abs();
-        state.text_matrix.e += advance * text_matrix.a;
-        state.text_matrix.f += advance * text_matrix.b;
+        state.text_matrix.e += total_width * text_matrix.a;
+        state.text_matrix.f += total_width * text_matrix.b;
 
         Ok(())
     }
@@ -5603,8 +6258,10 @@ impl TextExtractor {
             word_spacing: state.word_space, // Tw - captured from PDF content stream
             horizontal_scaling: state.horizontal_scaling, // Tz - captured from PDF content stream
             is_italic: is_italic_space,
+            is_monospace: false,
             primary_detected: false,
             artifact_type: self.current_artifact_type(),
+            char_widths: vec![],
         };
         self.span_sequence_counter += 1;
 
@@ -5612,11 +6269,10 @@ impl TextExtractor {
 
         self.spans.push(span);
 
-        // Advance position
+        // Advance position per ISO 32000-1:2008 §9.4.4
         let state = self.state_stack.current_mut();
-        let advance = space_width / text_matrix.d.abs();
-        state.text_matrix.e += advance * text_matrix.a;
-        state.text_matrix.f += advance * text_matrix.b;
+        state.text_matrix.e += space_width * text_matrix.a;
+        state.text_matrix.f += space_width * text_matrix.b;
 
         Ok(())
     }
@@ -5627,13 +6283,15 @@ impl TextExtractor {
         let font_size = state.font_size;
         let horizontal_scaling = state.horizontal_scaling;
 
-        // Calculate horizontal displacement per PDF spec
+        // Calculate horizontal displacement per PDF spec §9.4.4
         // tx = -offset / 1000.0 * font_size * horizontal_scaling / 100.0
         let tx = -offset / 1000.0 * font_size * horizontal_scaling / 100.0;
 
-        // Update text matrix position
+        // Update text matrix: Tm_new = [1 0 0 1 tx 0] × Tm_old
         let state = self.state_stack.current_mut();
-        state.text_matrix.e += tx;
+        let text_matrix = state.text_matrix;
+        state.text_matrix.e += tx * text_matrix.a;
+        state.text_matrix.f += tx * text_matrix.b;
 
         Ok(())
     }
@@ -5684,8 +6342,17 @@ impl TextExtractor {
                     word_spacing: 0.0, // Tw - per ISO 32000-1:2008 Section 9.3.1
                     horizontal_scaling: 100.0, // Tz - per ISO 32000-1:2008 Section 9.3.1
                     is_italic: is_italic_buf,
+                    is_monospace: buffer.is_monospace,
                     primary_detected: false,
                     artifact_type: None,
+                    char_widths: {
+                        let mut cw = std::mem::take(&mut buffer.char_widths);
+                        let h = buffer.user_h_scale;
+                        for w in &mut cw {
+                            *w *= h;
+                        }
+                        cw
+                    },
                 };
                 self.span_sequence_counter += 1;
 
@@ -5694,7 +6361,7 @@ impl TextExtractor {
                     if span.text.chars().all(|c| c.is_whitespace()) {
                         "<space-only>"
                     } else {
-                        &span.text[..span.text.len().min(20)]
+                        crate::utils::safe_prefix(&span.text, 20)
                     },
                     span.offset_semantic
                 );
@@ -5838,6 +6505,7 @@ impl TextExtractor {
                         color,
                         mcid: self.current_mcid,
                         is_italic: is_italic_char,
+                        is_monospace: false,
                         origin_x: char_origin_x,
                         origin_y: char_origin_y,
                         rotation_degrees,
@@ -5863,9 +6531,11 @@ impl TextExtractor {
                 tx += word_space * hs_factor;
             }
 
-            // Update text matrix in current state
+            // Update text matrix in current state per ISO 32000-1:2008 §9.4.4
             let state_mut = self.state_stack.current_mut();
-            state_mut.text_matrix.e += tx;
+            let tm = state_mut.text_matrix;
+            state_mut.text_matrix.e += tx * tm.a;
+            state_mut.text_matrix.f += tx * tm.b;
         }
 
         Ok(())
@@ -5882,16 +6552,19 @@ impl TextExtractor {
     }
 }
 
-/// Convert CMYK color to RGB color.
+/// Convert DeviceCMYK to DeviceRGB per ISO 32000-1:2008 §10.3.5:
 ///
-/// CMYK uses subtractive color model (for print), RGB uses additive (for screen).
-/// Conversion formula: R = 1 - min(1, C*(1-K) + K)
+///   R = 1 − min(1, C + K)
+///   G = 1 − min(1, M + K)
+///   B = 1 − min(1, Y + K)
 ///
-/// PDF Spec: ISO 32000-1:2008, Section 8.6.4.4 - DeviceCMYK Color Space
+/// Spec-mandated additive-clamp fallback for when no ICC profile drives
+/// the conversion. The multiplicative `(1-c)(1-k)` form is common in
+/// imaging libraries but is not what §10.3.5 specifies.
 fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
-    let r = 1.0 - (c * (1.0 - k) + k).min(1.0);
-    let g = 1.0 - (m * (1.0 - k) + k).min(1.0);
-    let b = 1.0 - (y * (1.0 - k) + k).min(1.0);
+    let r = 1.0 - (c + k).min(1.0);
+    let g = 1.0 - (m + k).min(1.0);
+    let b = 1.0 - (y + k).min(1.0);
     (r, g, b)
 }
 
@@ -5961,6 +6634,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -6180,19 +6854,79 @@ mod tests {
         assert_eq!(chars[0].color.b, 0.0);
     }
 
+    /// Regression test: is_monospace flag must propagate from FontInfo flags
+    /// through TjBuffer into the final TextSpan.
+    ///
+    /// When font descriptor flags have bit 0 (FixedPitch) set, spans produced
+    /// by extract_text_spans() must report is_monospace == true.
+    /// Conversely, a proportional font (e.g. Helvetica) must yield false.
     #[test]
-    #[ignore] // TODO: Fix Tf inside q/Q not working correctly
+    fn test_is_monospace_from_font_flags() {
+        // --- Monospace font: flags bit 0 (FixedPitch) set ---
+        let mut mono_font = create_test_font();
+        mono_font.base_font = "Courier".to_string();
+        mono_font.flags = Some(1); // bit 0 = FixedPitch
+
+        let mut extractor = TextExtractor::new();
+        extractor.add_font("F1".to_string(), mono_font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td (Code) Tj ET";
+        let spans = extractor.extract_text_spans(stream).unwrap();
+
+        assert!(!spans.is_empty(), "should produce at least one span");
+        assert!(
+            spans[0].is_monospace,
+            "Courier with FixedPitch flag should be monospace, got is_monospace=false"
+        );
+
+        // --- Proportional font: no FixedPitch flag ---
+        let mut prop_font = create_test_font();
+        prop_font.base_font = "Helvetica".to_string();
+        prop_font.flags = Some(0); // no FixedPitch
+
+        let mut extractor2 = TextExtractor::new();
+        extractor2.add_font("F2".to_string(), prop_font);
+
+        let stream2 = b"BT /F2 12 Tf 100 700 Td (Text) Tj ET";
+        let spans2 = extractor2.extract_text_spans(stream2).unwrap();
+
+        assert!(!spans2.is_empty(), "should produce at least one span");
+        assert!(
+            !spans2[0].is_monospace,
+            "Helvetica without FixedPitch flag should not be monospace"
+        );
+
+        // --- Name-based heuristic: font name containing MONO ---
+        let mut mono_name_font = create_test_font();
+        mono_name_font.base_font = "DejaVuSansMono".to_string();
+        mono_name_font.flags = None; // no flags at all
+
+        let mut extractor3 = TextExtractor::new();
+        extractor3.add_font("F3".to_string(), mono_name_font);
+
+        let stream3 = b"BT /F3 12 Tf 100 700 Td (Mono) Tj ET";
+        let spans3 = extractor3.extract_text_spans(stream3).unwrap();
+
+        assert!(!spans3.is_empty(), "should produce at least one span");
+        assert!(
+            spans3[0].is_monospace,
+            "Font named DejaVuSansMono should be detected as monospace via name heuristic"
+        );
+    }
+
+    #[test]
     fn test_extract_save_restore() {
         let mut extractor = TextExtractor::new();
         let font = create_test_font();
         extractor.add_font("F1".to_string(), font);
 
-        let stream = b"BT /F1 12 Tf q 14 Tf (A) Tj Q (B) Tj ET";
+        // Valid PDF: q saves state, Tf changes font size inside, Q restores
+        let stream = b"BT /F1 12 Tf q /F1 14 Tf (A) Tj Q (B) Tj ET";
         let chars = extractor.extract(stream).unwrap();
 
         assert_eq!(chars.len(), 2);
         assert_eq!(chars[0].font_size, 14.0); // Inside q/Q
-        assert_eq!(chars[1].font_size, 12.0); // After Q
+        assert_eq!(chars[1].font_size, 12.0); // After Q, restored to 12
     }
 
     #[test]
@@ -6240,24 +6974,6 @@ mod tests {
         assert_eq!(extractor.char_count(), 0);
     }
 
-    /// Test unified space decision: TJ offset rule
-    /// NOTE: Disabled - space detection has been refactored to be PDF spec-compliant
-    #[test]
-    #[ignore]
-    fn test_space_decision_tj_offset() {
-        let config = SpanMergingConfig::default();
-        let fonts = std::collections::HashMap::new();
-
-        // TJ offset triggered should always insert space (Rule 1, confidence 0.95)
-        let decision = should_insert_space(
-            "word", "next", 0.0, 12.0, "TestFont", &fonts, true, &config, None, None, 12.0, 12.0,
-        );
-
-        assert!(decision.insert_space);
-        assert_eq!(decision.source, SpaceSource::TjOffset);
-        assert_eq!(decision.confidence, 0.95);
-    }
-
     /// Test unified space decision: Boundary space already present
     #[test]
     fn test_space_decision_boundary_space() {
@@ -6279,112 +6995,38 @@ mod tests {
         assert_eq!(decision.source, SpaceSource::AlreadyPresent);
     }
 
-    /// Test unified space decision: Dual threshold rule
-    /// NOTE: Disabled - space detection has been refactored to be PDF spec-compliant
+    /// Regression test for issue flagged in PR #281 review:
+    /// a long number emitted as multiple digit-only spans with a kerning-sized
+    /// positive gap must NOT have a space inserted between the digits (would
+    /// turn "123456" into "123 456"). Adjacent table cell digit values with a
+    /// larger gap must still be separated.
     #[test]
-    #[ignore]
-    fn test_space_decision_dual_threshold() {
-        let config = SpanMergingConfig::default();
-        let fonts = std::collections::HashMap::new();
-        // space_threshold_em_ratio: 0.25, conservative_threshold_pt: 0.1
-
-        // 12pt font, space_threshold = 12 * 0.25 = 3pt
-        // char_width_threshold = 12 * 0.3 = 3.6pt
-        // dual_threshold = min(3, 3.6) = 3pt
-        let font_size = 12.0;
-
-        // Gap > dual_threshold should insert (Rule 2, confidence 0.8)
-        let decision = should_insert_space(
-            "word", "next", 3.5, font_size, "TestFont", &fonts, false, &config, None, None, 12.0,
-            12.0,
-        );
-        assert!(decision.insert_space);
-        assert_eq!(decision.source, SpaceSource::GeometricGap);
-        assert_eq!(decision.confidence, 0.8);
-
-        // Gap <= dual_threshold, not at heuristic boundary: no space (yet)
-        let decision = should_insert_space(
-            "word", "next", 2.5, font_size, "TestFont", &fonts, false, &config, None, None, 12.0,
-            12.0,
-        );
-        // This should not insert (no rule triggers)
-        // But conservative threshold (0.1) is still checked below
-    }
-
-    /// Test unified space decision: Character heuristic rule
-    /// NOTE: Disabled - heuristic rules removed in PDF spec-compliant refactoring
-    #[test]
-    #[ignore]
-    fn test_space_decision_heuristic_camelcase() {
+    fn test_space_decision_digit_digit_gap_threshold() {
         let config = SpanMergingConfig::default();
         let fonts = std::collections::HashMap::new();
 
-        // lowercase -> uppercase (CamelCase) should trigger heuristic (Rule 3, confidence 0.85)
-        let decision = should_insert_space(
-            "the", "General", 0.0, 12.0, "TestFont", &fonts, false, &config, None, None, 12.0, 12.0,
+        // Kerning-sized gap (0.3pt) between digit spans — must NOT insert.
+        // For 12pt font with no font-info fallback, geometric_threshold is
+        // typically around 1.5pt, so half of that is 0.75pt.
+        let kerning = should_insert_space(
+            "123", "456", 0.3, 12.0, "TestFont", &fonts, false, &config, None, None, 12.0, 12.0,
         );
-        assert!(decision.insert_space);
-        assert_eq!(decision.source, SpaceSource::CharacterHeuristic);
-        assert_eq!(decision.confidence, 0.85);
-
-        // numeric -> letter should trigger heuristic
-        let decision = should_insert_space(
-            "version2", "dot3", 0.0, 12.0, "TestFont", &fonts, false, &config, None, None, 12.0,
-            12.0,
-        );
-        assert!(decision.insert_space);
-        assert_eq!(decision.source, SpaceSource::CharacterHeuristic);
-    }
-
-    /// Test unified space decision: Conservative threshold rule
-    /// NOTE: Disabled - conservative threshold rules removed in PDF spec-compliant refactoring
-    #[test]
-    #[ignore]
-    fn test_space_decision_conservative_threshold() {
-        let config = SpanMergingConfig::default();
-        let fonts = std::collections::HashMap::new();
-        // conservative_threshold_pt: 0.1
-
-        // Gap > conservative_threshold but not meeting other rules (Rule 4, confidence 0.5)
-        let decision = should_insert_space(
-            "word", "next", 0.2, 12.0, "TestFont", &fonts, false, &config, None, None, 12.0, 12.0,
-        );
-        assert!(decision.insert_space);
-        assert_eq!(decision.source, SpaceSource::GeometricGap);
-        assert_eq!(decision.confidence, 0.5);
-
-        // Gap <= conservative_threshold: no space (Rule 5 - default)
-        let decision = should_insert_space(
-            "word", "next", 0.05, 12.0, "TestFont", &fonts, false, &config, None, None, 12.0, 12.0,
-        );
-        assert!(!decision.insert_space);
-        assert_eq!(decision.source, SpaceSource::NoSpace);
-    }
-
-    /// Test unified space decision: No double spaces
-    /// NOTE: Disabled - space detection has been refactored to be PDF spec-compliant
-    #[test]
-    #[ignore]
-    fn test_space_decision_no_double_spaces() {
-        let config = SpanMergingConfig::default();
-        let fonts = std::collections::HashMap::new();
-
-        // When both TJ offset and gap would trigger, they should be coordinated
-        // TJ offset has highest priority and should be respected first
-        let decision_tj = should_insert_space(
-            "word", "next", 1.0, 12.0, "TestFont", &fonts, true, &config, None, None, 12.0, 12.0,
-        );
-        let decision_gap = should_insert_space(
-            "word", "next", 1.0, 12.0, "TestFont", &fonts, false, &config, None, None, 12.0, 12.0,
+        assert!(
+            !kerning.insert_space,
+            "Kerning-sized gap (0.3pt) between digits must not split the number, got: {:?}",
+            kerning
         );
 
-        // TJ offset decision (0.95) should be preferred over gap decision
-        assert!(decision_tj.insert_space);
-        assert_eq!(decision_tj.source, SpaceSource::TjOffset);
-
-        // Gap alone would not trigger for 1pt gap (< conservative 0.1pt is false, but 1pt > 0.1pt is true)
-        // So gap should also trigger via conservative threshold
-        assert!(decision_gap.insert_space);
+        // Larger gap (2pt) between digit spans — adjacent table cell values,
+        // must still insert a space.
+        let table_cells = should_insert_space(
+            "123", "456", 2.0, 12.0, "TestFont", &fonts, false, &config, None, None, 12.0, 12.0,
+        );
+        assert!(
+            table_cells.insert_space,
+            "2pt gap between digits should still split adjacent table values, got: {:?}",
+            table_cells
+        );
     }
 
     /// Test split boundary merging with space insertion
@@ -6413,10 +7055,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -6437,9 +7081,11 @@ mod tests {
                 offset_semantic: false,
                 primary_detected: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
+                char_widths: vec![],
             },
         ];
 
@@ -6639,6 +7285,35 @@ mod tests {
         // After Td(100, 700), position should be near (100, 700)
         assert!((chars[0].bbox.x - 100.0).abs() < 2.0);
         assert!((chars[0].bbox.y - 700.0).abs() < 2.0);
+    }
+
+    /// Issue #254: TD Y offset must be scaled by the text matrix.
+    /// Pattern: `/F1 1 Tf 10 0 0 10 72 700 Tm (Line one) Tj 0 -1.3 TD (Line two) Tj`
+    /// The Tm sets a 10x scale, so `0 -1.3 TD` should produce a 13pt vertical gap,
+    /// not 1.3pt. Both lines must appear in extracted text.
+    #[test]
+    fn test_issue_254_tm_scale_td_offset() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        // Font size 1 with Tm scale 10 — effective font size is 10pt.
+        // TD(0, -1.3) in text space = 13pt in user space.
+        let stream = b"BT /F1 1 Tf 10 0 0 10 72 700 Tm (Line one) Tj 0 -1.3 TD (Line two) Tj ET";
+        let chars = extractor.extract(stream).unwrap();
+
+        // Collect unique text
+        let text: String = chars.iter().map(|c| c.char).collect();
+        assert!(text.contains("Line one"), "Should contain 'Line one', got: {}", text);
+        assert!(text.contains("Line two"), "Should contain 'Line two', got: {}", text);
+
+        // Verify the Y gap is ~13pt (1.3 * 10), not 1.3pt
+        let line_one_y = chars.iter().find(|c| c.char == 'L').unwrap().bbox.y;
+        let line_two_chars: Vec<_> = chars.iter().filter(|c| c.char == 'L').collect();
+        assert!(line_two_chars.len() >= 2, "Should have at least 2 'L' chars (one per line)");
+        let line_two_y = line_two_chars[1].bbox.y;
+        let y_gap = (line_one_y - line_two_y).abs();
+        assert!(y_gap > 5.0, "Y gap should be ~13pt (Tm-scaled), got {:.1}pt", y_gap);
     }
 
     #[test]
@@ -7756,6 +8431,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 100.0,
                 origin_y: 700.0,
                 rotation_degrees: 0.0,
@@ -7771,6 +8447,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 100.5,
                 origin_y: 700.0,
                 rotation_degrees: 0.0,
@@ -7798,6 +8475,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 100.0,
                 origin_y: 700.0,
                 rotation_degrees: 0.0,
@@ -7813,6 +8491,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 100.0,
                 origin_y: 680.0,
                 rotation_degrees: 0.0,
@@ -7830,6 +8509,168 @@ mod tests {
         let mut extractor = TextExtractor::new();
         extractor.deduplicate_overlapping_chars();
         assert!(extractor.chars.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_keeps_distinct_close_chars() {
+        // Issue #253: distinct characters close together should NOT be dropped
+        let mut extractor = TextExtractor::new();
+
+        let make_char = |c: char, x: f32| TextChar {
+            char: c,
+            bbox: Rect::new(x, 700.0, 6.0, 12.0),
+            font_name: "F1".to_string(),
+            font_size: 12.0,
+            font_weight: FontWeight::Normal,
+            color: Color::black(),
+            mcid: None,
+            is_italic: false,
+            is_monospace: false,
+            origin_x: x,
+            origin_y: 700.0,
+            rotation_degrees: 0.0,
+            advance_width: 6.0,
+            matrix: None,
+        };
+
+        // 't' at x=100, ' ' at x=105, 'r' at x=106.5 (within 2pt of ' ' but different char)
+        extractor.chars = vec![
+            make_char('t', 100.0),
+            make_char(' ', 105.0),
+            make_char('r', 106.5),
+        ];
+
+        extractor.deduplicate_overlapping_chars();
+        assert_eq!(
+            extractor.chars.len(),
+            3,
+            "Distinct characters close together must not be dropped"
+        );
+        assert_eq!(extractor.chars[0].char, 't');
+        assert_eq!(extractor.chars[1].char, ' ');
+        assert_eq!(extractor.chars[2].char, 'r');
+    }
+
+    #[test]
+    fn test_deduplicate_still_removes_same_char_duplicates() {
+        // Duplicate same character at nearly the same position should still be deduped
+        let mut extractor = TextExtractor::new();
+
+        let make_char = |c: char, x: f32| TextChar {
+            char: c,
+            bbox: Rect::new(x, 700.0, 6.0, 12.0),
+            font_name: "F1".to_string(),
+            font_size: 12.0,
+            font_weight: FontWeight::Normal,
+            color: Color::black(),
+            mcid: None,
+            is_italic: false,
+            is_monospace: false,
+            origin_x: x,
+            origin_y: 700.0,
+            rotation_degrees: 0.0,
+            advance_width: 6.0,
+            matrix: None,
+        };
+
+        extractor.chars = vec![make_char('A', 100.0), make_char('A', 100.5)];
+
+        extractor.deduplicate_overlapping_chars();
+        assert_eq!(extractor.chars.len(), 1, "Duplicate same char should still be deduped");
+        assert_eq!(extractor.chars[0].char, 'A');
+    }
+
+    #[test]
+    fn test_deduplicate_keeps_narrow_glyph_doublets() {
+        // Regression: `ll`, `rr`, `II`, `ii` in small-font body text were
+        // wrongly collapsed to a single glyph because the dedup threshold
+        // was a hardcoded 2 pt — larger than the advance width of narrow
+        // glyphs at ≤ 9 pt in most fonts (Helvetica `l` ≈ 2.5 pt at 9 pt,
+        // smaller below). This caused visible corruption like
+        // `controller → controler` and `billed → biled`.
+        //
+        // Exercises the matrix of four narrow glyphs across three small
+        // body-text sizes. Advance widths are the real Helvetica per-em
+        // values (0.278 em for `l`/`i`, 0.333 em for `r`, 0.278 em for `I`).
+        let narrow_char = |c: char, x: f32, font_size: f32, advance_em: f32| TextChar {
+            char: c,
+            bbox: Rect::new(x, 700.0, advance_em * font_size * 0.6, font_size),
+            font_name: "Helvetica".to_string(),
+            font_size,
+            font_weight: FontWeight::Normal,
+            color: Color::black(),
+            mcid: None,
+            is_italic: false,
+            is_monospace: false,
+            origin_x: x,
+            origin_y: 700.0,
+            rotation_degrees: 0.0,
+            advance_width: advance_em * font_size,
+            matrix: None,
+        };
+
+        // (glyph, Helvetica per-em advance width)
+        let cases: &[(char, f32)] = &[('l', 0.278), ('r', 0.333), ('I', 0.278), ('i', 0.278)];
+        // Body-text sizes where narrow-glyph advance falls at or below 2 pt.
+        let sizes: &[f32] = &[7.0, 9.0, 11.0];
+
+        for &(glyph, advance_em) in cases {
+            for &font_size in sizes {
+                let advance = advance_em * font_size;
+                let mut extractor = TextExtractor::new();
+                extractor.chars = vec![
+                    narrow_char(glyph, 100.0, font_size, advance_em),
+                    narrow_char(glyph, 100.0 + advance, font_size, advance_em),
+                ];
+
+                extractor.deduplicate_overlapping_chars();
+                assert_eq!(
+                    extractor.chars.len(),
+                    2,
+                    "Adjacent narrow-glyph doublet ('{glyph}{glyph}') at {font_size} pt \
+                     (advance = {advance:.2} pt) must not be collapsed",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_deduplicate_still_collapses_narrow_glyph_stroke_fill_duplicates() {
+        // Positive regression: even with the advance-scaled threshold,
+        // stroke+fill render passes on narrow glyphs (two `l`s at ~0 pt
+        // offset) must still be collapsed. The ratio (0.30) comfortably
+        // catches real duplicates (< 5 % of one advance apart) while
+        // staying below typical heaviest kerning (~20 %).
+        let mut extractor = TextExtractor::new();
+
+        let narrow_at = |x: f32| TextChar {
+            char: 'l',
+            bbox: Rect::new(x, 700.0, 1.5, 9.0),
+            font_name: "Helvetica".to_string(),
+            font_size: 9.0,
+            font_weight: FontWeight::Normal,
+            color: Color::black(),
+            mcid: None,
+            is_italic: false,
+            is_monospace: false,
+            origin_x: x,
+            origin_y: 700.0,
+            rotation_degrees: 0.0,
+            advance_width: 2.5, // 0.278 em × 9 pt
+            matrix: None,
+        };
+
+        // Stroke pass and fill pass typically land within 0.05 pt of each
+        // other (2 % of advance at 9 pt Helvetica `l`).
+        extractor.chars = vec![narrow_at(100.0), narrow_at(100.05)];
+
+        extractor.deduplicate_overlapping_chars();
+        assert_eq!(
+            extractor.chars.len(),
+            1,
+            "Stroke+fill narrow-glyph duplicates (same char at ~0 pt offset) \
+             must still be collapsed"
+        );
     }
 
     // ========================================================================
@@ -7853,10 +8694,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -7871,10 +8714,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -7887,6 +8732,104 @@ mod tests {
         let mut extractor = TextExtractor::new();
         extractor.deduplicate_overlapping_spans();
         assert!(extractor.spans.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_spans_keeps_narrow_glyph_doublets() {
+        // Regression: PDFs that emit kerned text glyph-by-glyph produce
+        // consecutive single-character spans. Two adjacent narrow-glyph
+        // spans (`l`, `r`, `I`, `i` at ≤ 9 pt) sit roughly one advance-width
+        // apart, which used to fall under the hardcoded 2 pt geometric
+        // threshold and get collapsed. The threshold now scales with each
+        // span's per-glyph width so legitimate doublets survive.
+        //
+        // Exercises the matrix of four narrow glyphs across three small
+        // body-text sizes.
+        let narrow_span =
+            |glyph: char, x: f32, font_size: f32, advance: f32, seq: usize| TextSpan {
+                artifact_type: None,
+                text: glyph.to_string(),
+                bbox: Rect::new(x, 700.0, advance, font_size),
+                font_name: "Helvetica".to_string(),
+                font_size,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: seq,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            };
+
+        // (glyph, Helvetica per-em advance width)
+        let cases: &[(char, f32)] = &[('l', 0.278), ('r', 0.333), ('I', 0.278), ('i', 0.278)];
+        let sizes: &[f32] = &[7.0, 9.0, 11.0];
+
+        for &(glyph, advance_em) in cases {
+            for &font_size in sizes {
+                let advance = advance_em * font_size;
+                let mut extractor = TextExtractor::new();
+                extractor.spans = vec![
+                    narrow_span(glyph, 100.0, font_size, advance, 0),
+                    narrow_span(glyph, 100.0 + advance, font_size, advance, 1),
+                ];
+
+                extractor.deduplicate_overlapping_spans();
+                assert_eq!(
+                    extractor.spans.len(),
+                    2,
+                    "Adjacent single-glyph narrow-doublet spans ('{glyph}{glyph}') \
+                     at {font_size} pt (advance = {advance:.2} pt) must not be collapsed",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_deduplicate_spans_still_collapses_stroke_fill_narrow_glyphs() {
+        // Positive regression: stroke+fill single-glyph narrow spans at
+        // ~0 pt offset must still be collapsed by the geometric dedup
+        // phase. The ratio (0.30) comfortably catches real duplicates
+        // while preserving legitimate doublets.
+        let mut extractor = TextExtractor::new();
+
+        let narrow_at = |x: f32, seq: usize| TextSpan {
+            artifact_type: None,
+            text: "l".to_string(),
+            bbox: Rect::new(x, 700.0, 2.5, 9.0),
+            font_name: "Helvetica".to_string(),
+            font_size: 9.0,
+            font_weight: FontWeight::Normal,
+            color: Color::black(),
+            mcid: None,
+            sequence: seq,
+            split_boundary_before: false,
+            offset_semantic: false,
+            is_italic: false,
+            is_monospace: false,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 100.0,
+            primary_detected: false,
+            char_widths: vec![],
+        };
+
+        // Stroke pass + fill pass at ~2 % of advance apart.
+        extractor.spans = vec![narrow_at(100.0, 0), narrow_at(100.05, 1)];
+
+        extractor.deduplicate_overlapping_spans();
+        assert_eq!(
+            extractor.spans.len(),
+            1,
+            "Stroke+fill narrow-glyph duplicate spans (same text at ~0 pt offset) \
+             must still be collapsed"
+        );
     }
 
     // ========================================================================
@@ -7918,10 +8861,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             });
         }
 
@@ -7947,6 +8892,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 100.0,
                 origin_y: 680.0,
                 rotation_degrees: 0.0,
@@ -7962,6 +8908,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 100.0,
                 origin_y: 700.0,
                 rotation_degrees: 0.0,
@@ -7990,6 +8937,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 200.0,
                 origin_y: 700.0,
                 rotation_degrees: 0.0,
@@ -8005,6 +8953,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 100.0,
                 origin_y: 700.0,
                 rotation_degrees: 0.0,
@@ -8032,6 +8981,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 0.0,
                 origin_y: 0.0,
                 rotation_degrees: 0.0,
@@ -8047,6 +8997,7 @@ mod tests {
                 color: Color::black(),
                 mcid: None,
                 is_italic: false,
+                is_monospace: false,
                 origin_x: 100.0,
                 origin_y: 700.0,
                 rotation_degrees: 0.0,
@@ -8083,10 +9034,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -8101,10 +9054,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -8133,10 +9088,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -8151,10 +9108,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -8188,10 +9147,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -8206,10 +9167,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -8236,10 +9199,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -8254,10 +9219,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: true, // TJ offset space
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -8272,10 +9239,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -10421,10 +11390,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -10439,10 +11410,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -10467,10 +11440,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -10485,10 +11460,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -10573,10 +11550,12 @@ mod tests {
             split_boundary_before: false,
             offset_semantic: false,
             is_italic: false,
+            is_monospace: false,
             char_spacing: 0.0,
             word_spacing: 0.0,
             horizontal_scaling: 100.0,
             primary_detected: false,
+            char_widths: vec![],
         }];
 
         extractor.split_fused_words();
@@ -10602,10 +11581,12 @@ mod tests {
             split_boundary_before: false,
             offset_semantic: false,
             is_italic: false,
+            is_monospace: false,
             char_spacing: 0.0,
             word_spacing: 0.0,
             horizontal_scaling: 100.0,
             primary_detected: false,
+            char_widths: vec![],
         }];
 
         extractor.split_fused_words();
@@ -10778,10 +11759,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -10796,10 +11779,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -10870,10 +11855,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -10888,10 +11875,12 @@ mod tests {
                 split_boundary_before: true, // forces merge-with-space path
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -11178,10 +12167,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -11196,10 +12187,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -11310,10 +12303,12 @@ mod tests {
                 split_boundary_before: false,
                 offset_semantic: false,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
             TextSpan {
                 artifact_type: None,
@@ -11328,10 +12323,12 @@ mod tests {
                 split_boundary_before: true, // forcing merge path
                 offset_semantic: true,
                 is_italic: false,
+                is_monospace: false,
                 char_spacing: 0.0,
                 word_spacing: 0.0,
                 horizontal_scaling: 100.0,
                 primary_detected: false,
+                char_widths: vec![],
             },
         ];
 
@@ -11807,5 +12804,462 @@ mod profile_based_space_tests {
             default_config.space_insertion_threshold, conservative_profile.tj_offset_threshold,
             "Default config should use conservative threshold for backward compatibility"
         );
+    }
+
+    /// Test that adjacent table cell values get spaces inserted between them.
+    ///
+    /// Simulates a form where two "$0.00" values are in adjacent cells with
+    /// a small positive gap (1pt). The merge logic should insert a space because
+    /// the spans are clearly separate tokens (ending/starting with digits/currency).
+    #[test]
+    fn test_adjacent_table_cell_values_not_concatenated() {
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy();
+
+        // "$0.00" at 10pt font is about 30pt wide (5 chars * ~6pt average width)
+        // Second value starts at x=131, creating a 1pt gap (100 + 30 = 130, gap = 1pt)
+        extractor.spans = vec![
+            TextSpan {
+                artifact_type: None,
+                text: "$0.00".to_string(),
+                bbox: Rect::new(100.0, 700.0, 30.0, 10.0),
+                font_name: "F1".to_string(),
+                font_size: 10.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 0,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+            TextSpan {
+                artifact_type: None,
+                text: "$0.00".to_string(),
+                bbox: Rect::new(131.0, 700.0, 30.0, 10.0), // 1pt gap
+                font_name: "F1".to_string(),
+                font_size: 10.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 1,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+        assert_eq!(extractor.spans.len(), 1, "Adjacent spans should merge");
+        assert_eq!(
+            extractor.spans[0].text, "$0.00 $0.00",
+            "Adjacent table cell values should have space between them, got: '{}'",
+            extractor.spans[0].text
+        );
+    }
+
+    /// Test that adjacent numeric values with small gaps get spaces.
+    /// Covers cases like "100200" that should be "100 200" in table contexts.
+    #[test]
+    fn test_adjacent_numeric_values_not_concatenated() {
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy();
+
+        extractor.spans = vec![
+            TextSpan {
+                artifact_type: None,
+                text: "100".to_string(),
+                bbox: Rect::new(200.0, 500.0, 18.0, 10.0),
+                font_name: "F1".to_string(),
+                font_size: 10.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 0,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+            TextSpan {
+                artifact_type: None,
+                text: "200".to_string(),
+                bbox: Rect::new(219.5, 500.0, 18.0, 10.0), // 1.5pt gap
+                font_name: "F1".to_string(),
+                font_size: 10.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 1,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+        assert_eq!(extractor.spans.len(), 1, "Adjacent spans should merge");
+        assert_eq!(
+            extractor.spans[0].text, "100 200",
+            "Adjacent numeric values should have space between them, got: '{}'",
+            extractor.spans[0].text
+        );
+    }
+
+    /// Ensure that true word fragments (zero gap) still merge without space.
+    /// E.g., "Hel" + "lo" with gap=0 should become "Hello" not "Hel lo".
+    #[test]
+    fn test_word_fragments_zero_gap_no_space() {
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy();
+
+        extractor.spans = vec![
+            TextSpan {
+                artifact_type: None,
+                text: "Hel".to_string(),
+                bbox: Rect::new(100.0, 700.0, 18.0, 12.0),
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 0,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+            TextSpan {
+                artifact_type: None,
+                text: "lo".to_string(),
+                bbox: Rect::new(118.0, 700.0, 12.0, 12.0), // 0pt gap
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 1,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+        assert_eq!(extractor.spans.len(), 1, "Adjacent spans should merge");
+        assert_eq!(
+            extractor.spans[0].text, "Hello",
+            "Zero-gap word fragments should merge without space, got: '{}'",
+            extractor.spans[0].text
+        );
+    }
+
+    // ========================================================================
+    // Decimal dollar value merging (split integer/decimal boxes)
+    // ========================================================================
+
+    #[test]
+    fn test_merge_decimal_dollar_value_split_boxes() {
+        // Some forms have integer and decimal parts in separate fixed-width boxes.
+        // e.g., "123456" at x=382.3 width=39.6, "72" at x=432.7 width=13.2
+        // gap = 432.7 - (382.3 + 39.6) = 10.8pt
+        // These should be merged as "123456.72"
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy();
+
+        extractor.spans = vec![
+            TextSpan {
+                artifact_type: None,
+                text: "123456".to_string(),
+                bbox: Rect::new(382.3, 700.0, 39.6, 12.0),
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 0,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+            TextSpan {
+                artifact_type: None,
+                text: "72".to_string(),
+                bbox: Rect::new(432.7, 700.0, 13.2, 12.0), // 10.8pt gap
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 1,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+        assert_eq!(extractor.spans.len(), 1, "Decimal dollar value spans should merge into one");
+        assert_eq!(
+            extractor.spans[0].text, "123456.72",
+            "Integer and decimal parts should be joined with '.'"
+        );
+    }
+
+    #[test]
+    fn test_merge_decimal_value_small_integer_part() {
+        // Smaller dollar amount: "50" + "00" -> "50.00"
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy();
+
+        extractor.spans = vec![
+            TextSpan {
+                artifact_type: None,
+                text: "50".to_string(),
+                bbox: Rect::new(382.3, 700.0, 15.0, 12.0),
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 0,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+            TextSpan {
+                artifact_type: None,
+                text: "00".to_string(),
+                bbox: Rect::new(407.0, 700.0, 13.2, 12.0), // 9.7pt gap
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 1,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+        assert_eq!(extractor.spans.len(), 1);
+        assert_eq!(extractor.spans[0].text, "50.00");
+    }
+
+    #[test]
+    fn test_no_decimal_merge_for_non_digit_spans() {
+        // Should NOT merge "Hello" + "72" as decimal
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy();
+
+        extractor.spans = vec![
+            TextSpan {
+                artifact_type: None,
+                text: "Hello".to_string(),
+                bbox: Rect::new(382.3, 700.0, 39.6, 12.0),
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 0,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+            TextSpan {
+                artifact_type: None,
+                text: "72".to_string(),
+                bbox: Rect::new(432.7, 700.0, 13.2, 12.0), // 10.8pt gap
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 1,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+        // Should NOT merge because first span is not all digits
+        assert_eq!(
+            extractor.spans.len(),
+            2,
+            "Non-digit spans should not be merged as decimal values"
+        );
+    }
+
+    #[test]
+    fn test_no_decimal_merge_for_long_decimal_part() {
+        // Should NOT merge "123456" + "723" (3-digit decimal part is not a cents pattern)
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy();
+
+        extractor.spans = vec![
+            TextSpan {
+                artifact_type: None,
+                text: "123456".to_string(),
+                bbox: Rect::new(382.3, 700.0, 39.6, 12.0),
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 0,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+            TextSpan {
+                artifact_type: None,
+                text: "723".to_string(),
+                bbox: Rect::new(432.7, 700.0, 18.0, 12.0), // 10.8pt gap
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                sequence: 1,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+        // Should NOT merge because decimal part has 3 digits (not a cents pattern)
+        assert_eq!(
+            extractor.spans.len(),
+            2,
+            "3-digit decimal part should not trigger decimal merge"
+        );
+    }
+
+    #[test]
+    fn test_cross_font_word_glue_single_letter_prefix() {
+        // A single-letter span in one font, tight-kerned against a
+        // multi-letter span in another font, is the drop-cap pattern.
+        // These must merge into one word with the longer run's font
+        // metadata — emitting per-letter emphasis runs corrupts proper
+        // nouns.
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::default();
+
+        extractor.spans = vec![
+            TextSpan {
+                text: "S".to_string(),
+                bbox: Rect::new(72.0, 700.0, 10.0, 12.0),
+                font_name: "Helvetica-Bold".to_string(),
+                font_weight: FontWeight::Bold,
+                font_size: 12.0,
+                ..TextSpan::default()
+            },
+            TextSpan {
+                text: "ales".to_string(),
+                bbox: Rect::new(82.0, 700.0, 30.0, 12.0),
+                font_name: "Helvetica".to_string(),
+                font_weight: FontWeight::Normal,
+                font_size: 12.0,
+                ..TextSpan::default()
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+
+        assert_eq!(
+            extractor.spans.len(),
+            1,
+            "cross_font_word_glue should merge 'S' + 'ales' into 'Sales'"
+        );
+        assert_eq!(extractor.spans[0].text, "Sales");
+        // Dominant-font swap: the longer run (regular weight) should win.
+        assert_eq!(extractor.spans[0].font_weight, FontWeight::Normal);
     }
 }

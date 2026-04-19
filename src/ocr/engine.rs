@@ -64,6 +64,7 @@ impl OcrSpan {
             font_size,
             font_weight: FontWeight::Normal,
             is_italic: false,
+            is_monospace: false,
             color: Color::black(),
             mcid: None,
             sequence,
@@ -73,6 +74,7 @@ impl OcrSpan {
             word_spacing: 0.0,
             horizontal_scaling: 100.0,
             primary_detected: false,
+            char_widths: Vec::new(),
         }
     }
 

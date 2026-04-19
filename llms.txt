@@ -1,13 +1,16 @@
 # PDF Oxide — The Fastest PDF Library for Python and Rust
 
-> The fastest PDF library for Python and Rust.
+> The fastest PDF library for Python, Rust, Go, JavaScript/Node.js, and C#.
 > Text extraction, image extraction, PDF creation, editing, and markdown conversion.
 > 0.8ms mean per document. 100% pass rate on 3,830 real-world PDFs.
 > 5× faster than PyMuPDF, 15× faster than pypdf.
-> MIT / Apache-2.0 license. Current version: 0.3.9.
+> MIT / Apache-2.0 license. Current version: 0.3.24.
 
 - Python: `pip install pdf-oxide`
 - Rust: `cargo add pdf_oxide`
+- Go: `go get github.com/yfedoseev/pdf_oxide/go`
+- JavaScript/Node.js: `npm install pdf-oxide`
+- C#/.NET: `dotnet add package PdfOxide`
 - Documentation: https://pdf.oxide.fyi
 - Full documentation in one file: https://pdf.oxide.fyi/llms-full.txt
 
@@ -15,6 +18,9 @@
 
 - [Python Quick Start](https://raw.githubusercontent.com/yfedoseev/pdf_oxide/main/docs/getting-started-python.md): Install with pip, extract text, create PDFs, edit documents
 - [Rust Quick Start](https://raw.githubusercontent.com/yfedoseev/pdf_oxide/main/docs/getting-started-rust.md): Add to Cargo.toml, PdfDocument and Pdf APIs, error handling
+- [Go Examples](https://github.com/yfedoseev/pdf_oxide/tree/main/examples/go): 8 runnable examples covering extraction, creation, search, editing, batch processing
+- [JavaScript Examples](https://github.com/yfedoseev/pdf_oxide/tree/main/examples/javascript): 8 runnable examples for Node.js
+- [C# Examples](https://github.com/yfedoseev/pdf_oxide/tree/main/examples/csharp): 8 runnable examples for .NET
 
 ## API Reference
 
@@ -22,7 +28,7 @@
 - [README](https://raw.githubusercontent.com/yfedoseev/pdf_oxide/main/README.md): Project overview, installation, quick start examples
 - [Changelog](https://raw.githubusercontent.com/yfedoseev/pdf_oxide/main/CHANGELOG.md): Version history and release notes
 
-## Performance (v0.3.9)
+## Performance (v0.3.24)
 
 Benchmarked on 3,830 PDFs (veraPDF, Mozilla pdf.js, DARPA SafeDocs). Text extraction libraries only (no OCR).
 
@@ -38,6 +44,10 @@ Text quality: 99.5% parity vs PyMuPDF/pypdfium2.
 ## Extraction
 
 - extract_text(page_index): Extract plain text from a page
+- extract_words(page_index, region=None, word_gap_threshold=None, profile=None): Word-level extraction with bounding boxes. Optional word_gap_threshold (PDF points) overrides adaptive splitting. Optional profile (ExtractionProfile) controls span-level text parsing.
+- extract_text_lines(page_index, region=None, word_gap_threshold=None, line_gap_threshold=None, profile=None): Line-level extraction. Optional thresholds (PDF points) override adaptive word/line grouping. Optional profile controls span-level text parsing.
+- page_layout_params(page_index): Returns computed adaptive thresholds (word_gap, line_gap, median_char_width, median_font_size, etc.) for inspection.
+- ExtractionProfile: Pre-tuned profiles for document types. Pass to extract_words()/extract_text_lines() via profile= kwarg. Static methods: conservative(), aggressive(), balanced(), academic(), policy(), form(), government(), scanned_ocr(), adaptive().
 - extract_spans(page_index): Extract text with font, size, color, position metadata
 - extract_chars(page_index): Per-character extraction with bounding boxes
 - extract_images(page_index): Extract images from content streams, XObjects, inline

@@ -10,6 +10,7 @@ These tests verify the Python API works correctly, including:
 - Error handling
 """
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -784,6 +785,35 @@ def test_extract_paths():
         pytest.skip("Test fixture 'simple.pdf' not available or invalid")
 
 
+def test_extract_paths_operations():
+    """Test that extract_paths returns operations with coordinates."""
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        paths = doc.extract_paths(0)
+        assert isinstance(paths, list)
+        assert len(paths) > 0, "Expected at least one path"
+
+        for path in paths:
+            assert "operations" in path, "Path dict should contain 'operations' field"
+            assert isinstance(path["operations"], list)
+            assert len(path["operations"]) == path["operations_count"]
+
+            for op in path["operations"]:
+                assert isinstance(op, dict)
+                assert "op" in op, "Each operation should have an 'op' field"
+                op_type = op["op"]
+                assert op_type in ("move_to", "line_to", "curve_to", "rectangle", "close_path")
+
+                if op_type in ("move_to", "line_to"):
+                    assert "x" in op and "y" in op
+                elif op_type == "curve_to":
+                    assert all(k in op for k in ("cx1", "cy1", "cx2", "cy2", "x", "y"))
+                elif op_type == "rectangle":
+                    assert all(k in op for k in ("x", "y", "width", "height"))
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
 def test_extract_images_invalid_page():
     """Test extract_images with invalid page index."""
     try:
@@ -1314,6 +1344,329 @@ def test_xmp_metadata():
         assert metadata is None or isinstance(metadata, dict)
     except (OSError, RuntimeError):
         pytest.skip("Test fixture 'simple.pdf' not available or invalid")
+
+
+class _PdfOxideLogCapture(logging.Handler):
+    """Captures log records emitted under the ``pdf_oxide`` logger tree.
+
+    We attach this directly to the ``pdf_oxide`` logger (rather than using
+    pytest's ``caplog``) because ``pyo3_log`` emits on child loggers such as
+    ``pdf_oxide.xref`` / ``pdf_oxide.document``, and caplog's per-logger
+    level plumbing doesn't always surface those child records reliably.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        # Note: no type annotation on ``self.records`` — we support Python
+        # 3.8 and PEP 585 ``list[X]`` generic syntax is 3.9+. Using
+        # ``typing.List`` would also work; skipping the annotation entirely
+        # is simpler for a test fixture.
+        self.records = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _capture_pdf_oxide_logs():
+    """Install a handler on the pdf_oxide logger and set it to DEBUG."""
+    logger = logging.getLogger("pdf_oxide")
+    handler = _PdfOxideLogCapture()
+    logger.addHandler(handler)
+    prev_level = logger.level
+    prev_propagate = logger.propagate
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    return logger, handler, prev_level, prev_propagate
+
+
+def test_log_level_issue_283_regression():
+    """Regression test for #283 — Python log level honored by extraction pipeline.
+
+    Runs the reproduction from the issue (extract_text with a real PDF) twice
+    in a single test so the two assertions share one process and one pyo3_log
+    cache state:
+
+    1. With ``set_log_level('debug')`` the pipeline emits DEBUG records on
+       the ``pdf_oxide`` logger tree (sanity check — if this fails, either
+       the ``pyo3_log`` bridge is broken or the Rust macros aren't emitting
+       at all, which would make assertion 2 pass vacuously).
+    2. With ``set_log_level('error')`` no DEBUG / TRACE / INFO / WARN records
+       leak through (the actual regression — before the fix, the
+       ``extract_log_*!`` macros bypassed the ``log`` crate via ``eprintln!``
+       and so ignored both ``pdf_oxide.set_log_level`` and
+       ``logging.basicConfig``).
+
+    The debug phase must run first, because once ``log::set_max_level`` is
+    lowered to Error the Rust ``log::debug!`` calls are short-circuited at
+    compile-time checks and never reach pyo3_log — a subsequent re-raise to
+    Debug in the same process doesn't always re-enable them due to pyo3_log's
+    per-logger level cache.
+    """
+    import pdf_oxide
+
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+    # Capture the pre-test Rust-side log level so we can restore it exactly
+    # instead of hard-coding "info" — avoids leaking global state across
+    # tests in the same process.
+    prev_rust_level = pdf_oxide.get_log_level()
+    logger, handler, prev_level, prev_propagate = _capture_pdf_oxide_logs()
+    try:
+        # Phase 1: DEBUG level should produce at least some DEBUG records.
+        pdf_oxide.set_log_level("debug")
+        for page in range(doc.page_count()):
+            doc.extract_text(page)
+        debug_records = [r for r in handler.records if r.levelno == logging.DEBUG]
+        assert debug_records, (
+            "expected at least one DEBUG record from pdf_oxide at DEBUG level — "
+            "if this fails, the pyo3_log bridge is broken and the suppression "
+            "assertion below would pass vacuously"
+        )
+
+        # Phase 2: ERROR level must suppress everything below ERROR.
+        handler.records.clear()
+        pdf_oxide.set_log_level("error")
+        for page in range(doc.page_count()):
+            doc.extract_text(page)
+        leaked = [r for r in handler.records if r.levelno < logging.ERROR]
+        assert not leaked, (
+            f"DEBUG/TRACE/INFO/WARN records leaked at ERROR level (regression "
+            f"of #283): {[(r.name, r.levelname, r.getMessage()) for r in leaked[:5]]}"
+        )
+    finally:
+        pdf_oxide.set_log_level(prev_rust_level)
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
+        logger.propagate = prev_propagate
+
+
+# === Word/Line Extraction Tests ===
+
+
+def test_extract_words_basic():
+    """Test extracting words from a page."""
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        words = doc.extract_words(0)
+        assert isinstance(words, list)
+        assert len(words) > 0
+        for w in words:
+            assert hasattr(w, "text")
+            assert hasattr(w, "bbox")
+            assert isinstance(w.text, str)
+            assert len(w.text) > 0
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+def test_extract_words_with_threshold():
+    """Test extracting words with a custom word_gap_threshold."""
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        words_default = doc.extract_words(0)
+        words_tight = doc.extract_words(0, word_gap_threshold=0.5)
+        assert isinstance(words_tight, list)
+        assert len(words_tight) > 0
+        # A tighter threshold should generally produce at least as many words
+        assert len(words_tight) >= len(words_default)
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+def test_extract_words_with_region_and_threshold():
+    """Test extracting words with both region and threshold."""
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        words = doc.extract_words(0, region=(0, 0, 300, 400), word_gap_threshold=2.0)
+        assert isinstance(words, list)
+        # Region-filtered results should be a subset of full page
+        all_words = doc.extract_words(0, word_gap_threshold=2.0)
+        assert len(words) <= len(all_words)
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+def test_extract_text_lines_basic():
+    """Test extracting text lines from a page."""
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        lines = doc.extract_text_lines(0)
+        assert isinstance(lines, list)
+        assert len(lines) > 0
+        for line in lines:
+            assert hasattr(line, "text")
+            assert hasattr(line, "bbox")
+            assert isinstance(line.text, str)
+            assert len(line.text) > 0
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+def test_extract_text_lines_with_thresholds():
+    """Test extracting text lines with custom thresholds."""
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        lines = doc.extract_text_lines(0, word_gap_threshold=2.0, line_gap_threshold=5.0)
+        assert isinstance(lines, list)
+        assert len(lines) > 0
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+# === Page Layout Params Tests ===
+
+
+def test_page_layout_params():
+    """Test computing adaptive layout parameters for a page."""
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        params = doc.page_layout_params(0)
+        assert hasattr(params, "word_gap_threshold")
+        assert hasattr(params, "line_gap_threshold")
+        assert hasattr(params, "median_char_width")
+        assert hasattr(params, "median_font_size")
+        assert hasattr(params, "median_line_spacing")
+        assert hasattr(params, "column_count")
+        # Sanity checks — thresholds should be positive
+        assert params.word_gap_threshold > 0
+        assert params.line_gap_threshold > 0
+        assert params.median_char_width > 0
+        assert params.median_font_size > 0
+        # __repr__ should include LayoutParams
+        r = repr(params)
+        assert "LayoutParams" in r
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+def test_page_layout_params_invalid_page():
+    """Test page_layout_params with an invalid page index."""
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        with pytest.raises(RuntimeError):
+            doc.page_layout_params(9999)
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+# === ExtractionProfile Tests ===
+
+
+def test_extraction_profile_inspect():
+    """Test ExtractionProfile static constructors and attributes."""
+    from pdf_oxide import ExtractionProfile
+
+    profile = ExtractionProfile.form()
+    assert profile.name == "Form"
+    assert isinstance(profile.tj_offset_threshold, float)
+    assert isinstance(profile.word_margin_ratio, float)
+    assert isinstance(profile.space_threshold_em_ratio, float)
+    assert isinstance(profile.space_char_multiplier, float)
+    assert isinstance(profile.use_adaptive_threshold, bool)
+
+    r = repr(profile)
+    assert "ExtractionProfile" in r
+    assert "Form" in r
+
+
+def test_extraction_profile_available():
+    """Test ExtractionProfile.available() returns all profile names."""
+    from pdf_oxide import ExtractionProfile
+
+    names = ExtractionProfile.available()
+    assert isinstance(names, list)
+    assert len(names) >= 9
+    assert "Form" in names
+    assert "Academic" in names
+
+
+def test_extraction_profile_all_constructors():
+    """Test that all profile static constructors work."""
+    from pdf_oxide import ExtractionProfile
+
+    constructors = [
+        ExtractionProfile.conservative,
+        ExtractionProfile.aggressive,
+        ExtractionProfile.balanced,
+        ExtractionProfile.academic,
+        ExtractionProfile.policy,
+        ExtractionProfile.form,
+        ExtractionProfile.government,
+        ExtractionProfile.scanned_ocr,
+        ExtractionProfile.adaptive,
+    ]
+    for ctor in constructors:
+        profile = ctor()
+        assert isinstance(profile.name, str)
+        assert len(profile.name) > 0
+
+
+def test_extract_words_with_profile():
+    """Test extracting words with an ExtractionProfile."""
+    from pdf_oxide import ExtractionProfile
+
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        profile = ExtractionProfile.form()
+        words = doc.extract_words(0, profile=profile)
+        assert isinstance(words, list)
+        assert len(words) > 0
+        for w in words:
+            assert isinstance(w.text, str)
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+def test_extract_text_lines_with_profile():
+    """Test extracting text lines with an ExtractionProfile."""
+    from pdf_oxide import ExtractionProfile
+
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        profile = ExtractionProfile.academic()
+        lines = doc.extract_text_lines(0, profile=profile)
+        assert isinstance(lines, list)
+        assert len(lines) > 0
+        for line in lines:
+            assert isinstance(line.text, str)
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+def test_extract_words_profile_and_threshold():
+    """Test combining profile with threshold overrides."""
+    from pdf_oxide import ExtractionProfile
+
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        profile = ExtractionProfile.aggressive()
+        words = doc.extract_words(0, word_gap_threshold=1.5, profile=profile)
+        assert isinstance(words, list)
+        assert len(words) > 0
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
+
+
+def test_extract_text_lines_profile_and_thresholds():
+    """Test combining profile with both threshold overrides for text lines."""
+    from pdf_oxide import ExtractionProfile
+
+    try:
+        doc = PdfDocument("tests/fixtures/1.pdf")
+        profile = ExtractionProfile.policy()
+        lines = doc.extract_text_lines(
+            0,
+            word_gap_threshold=2.0,
+            line_gap_threshold=5.0,
+            profile=profile,
+        )
+        assert isinstance(lines, list)
+        assert len(lines) > 0
+    except (OSError, RuntimeError):
+        pytest.skip("Test fixture '1.pdf' not available or invalid")
 
 
 # Note: To run these tests successfully, you'll need to:

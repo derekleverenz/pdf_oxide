@@ -80,6 +80,9 @@ pub struct FontInfo {
     /// Multi-character encoding map for compound glyph names (e.g. f_f → "ff")
     /// Stores mappings from character code to multi-char strings
     pub multi_char_map: HashMap<u8, String>,
+    /// CFF byte_code → glyph_id mapping for embedded CFF subset fonts.
+    /// Allows direct glyph rendering without Unicode cmap.
+    pub cff_gid_map: Option<HashMap<u8, u16>>,
     /// Pre-computed byte→char lookup for simple (non-Type0) fonts.
     /// Index by byte value (0-255). '\0' means "use full char_to_unicode fallback".
     /// Built lazily on first text decode. Avoids per-byte HashMap lookups.
@@ -277,7 +280,7 @@ impl FontInfo {
 
         // Parse FontDescriptor FIRST to get font flags (needed for encoding decision)
         // PDF Spec: ISO 32000-1:2008, Section 9.6.2 - Font Descriptor
-        let (font_weight, flags, stem_v, embedded_font_data, is_truetype_font) =
+        let (font_weight, flags, stem_v, mut embedded_font_data, is_truetype_font) =
             if let Some(descriptor_ref) = font_dict
                 .get("FontDescriptor")
                 .and_then(|obj| obj.as_reference())
@@ -326,9 +329,9 @@ impl FontInfo {
                                 (font_data, true) // TrueType - can have cmaps
                             } else if let Some(ff3_obj) = descriptor_dict.get("FontFile3") {
                                 log::info!(
-                                "Font '{}' has FontFile3 entry (CFF/OpenType - no TrueType cmap)",
-                                base_font
-                            );
+                            "Font '{}' has FontFile3 entry (CFF/OpenType - no TrueType cmap)",
+                            base_font
+                        );
                                 let font_data = ff3_obj
                                     .as_reference()
                                     .and_then(|ff3_ref| {
@@ -338,11 +341,23 @@ impl FontInfo {
                                         doc.decode_stream_with_encryption(&ff3_stream, ff3_ref).ok()
                                     })
                                     .map(|data| {
-                                        log::info!(
+                                        // Wrap raw CFF in OpenType container for ttf-parser
+                                        let data =
+                                            if !data.is_empty() && data[0] == 1 && data.len() > 4 {
+                                                log::info!(
+                                        "Font '{}': Wrapping raw CFF in OpenType ({} bytes)",
+                                        base_font,
+                                        data.len()
+                                    );
+                                                wrap_cff_in_opentype(&data)
+                                            } else {
+                                                log::info!(
                                         "Font '{}' loaded embedded CFF/OpenType font ({} bytes)",
                                         base_font,
                                         data.len()
                                     );
+                                                data
+                                            };
                                         Arc::new(data)
                                     });
                                 (font_data, false) // CFF - no TrueType cmap
@@ -570,7 +585,7 @@ impl FontInfo {
         // For simple fonts (Type1, TrueType), widths are specified as an array
         // of integers in 1000ths of em, indexed from FirstChar to LastChar.
         //
-        // Note: Type0 (CID) fonts use a different /W array format (not yet implemented)
+        // Note: Type0 (CID) fonts use a different /W array format, parsed via parse_descendant_fonts below
         let (widths, first_char, last_char) = if subtype != "Type0" {
             // Try to parse /Widths array
             let widths_opt = font_dict.get("Widths").and_then(|widths_obj| {
@@ -646,9 +661,9 @@ impl FontInfo {
             descendant_tt_cmap,
         ) = if subtype == "Type0" {
             match Self::parse_descendant_fonts(font_dict, &base_font, doc) {
-                Ok((map, info, ftype, widths, dw, tt_cmap)) => {
+                Ok((map, info, ftype, widths, dw, tt_cmap, desc_embedded)) => {
                     log::info!(
-                            "Font '{}': Parsed DescendantFonts - CIDFontType={}, CIDSystemInfo={}-{}, widths={}",
+                            "Font '{}': Parsed DescendantFonts - CIDFontType={}, CIDSystemInfo={}-{}, widths={}, embedded={}",
                             base_font,
                             ftype.as_ref().unwrap_or(&"Unknown".to_string()),
                             info.as_ref()
@@ -657,8 +672,13 @@ impl FontInfo {
                             info.as_ref()
                                 .map(|s| s.ordering.as_str())
                                 .unwrap_or("Unknown"),
-                            widths.as_ref().map(|m| m.len()).unwrap_or(0)
+                            widths.as_ref().map(|m| m.len()).unwrap_or(0),
+                            desc_embedded.is_some()
                         );
+                    // Use embedded font data from CIDFont descendant if top-level didn't have it
+                    if desc_embedded.is_some() && embedded_font_data.is_none() {
+                        embedded_font_data = desc_embedded;
+                    }
                     (map, info, ftype, widths, dw, tt_cmap)
                 },
                 Err(e) => {
@@ -681,6 +701,22 @@ impl FontInfo {
             let _ = truetype_cmap_lock.set(Some(desc_cmap));
         }
 
+        // Parse CFF GID mapping ONLY for simple (non-Type0) fonts with embedded CFF data.
+        // Type0/CID fonts use Identity-H encoding and CIDToGIDMap, not CFF Standard Encoding.
+        let cff_gid_map = if subtype != "Type0" {
+            embedded_font_data.as_ref().and_then(|data| {
+                super::cff_encoding::parse_cff_gid_mapping(data).inspect(|map| {
+                    log::debug!(
+                        "Font '{}': parsed CFF GID mapping ({} entries)",
+                        base_font,
+                        map.len()
+                    );
+                })
+            })
+        } else {
+            None
+        };
+
         Ok(FontInfo {
             base_font,
             subtype,
@@ -701,6 +737,7 @@ impl FontInfo {
             default_width,
             cid_widths,
             cid_default_width,
+            cff_gid_map,
             multi_char_map: diff_multi_char_map,
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -782,6 +819,7 @@ impl FontInfo {
         Option<HashMap<u16, f32>>,
         f32,
         Option<TrueTypeCMap>, // TrueType cmap from descendant's embedded font
+        Option<Arc<Vec<u8>>>, // Embedded font data from CIDFont's FontDescriptor
     )> {
         let descendant_obj = font_dict
             .get("DescendantFonts")
@@ -974,15 +1012,43 @@ impl FontInfo {
         // Default is 1000 if not specified
         let cid_default_width = cidfont_dict
             .get("DW")
-            .and_then(|obj| match obj {
-                Object::Integer(i) => Some(*i as f32),
-                Object::Real(r) => Some(*r as f32),
-                _ => None,
+            .and_then(|obj| {
+                // Resolve indirect reference if needed
+                let resolved = if let Some(r) = obj.as_reference() {
+                    doc.load_object(r).ok()
+                } else {
+                    Some(obj.clone())
+                };
+                resolved.and_then(|o| match &o {
+                    Object::Integer(i) => Some(*i as f32),
+                    Object::Real(r) => Some(*r as f32),
+                    _ => None,
+                })
             })
             .unwrap_or(1000.0);
 
         // Parse /W array (CID widths) - PDF Spec Section 9.7.4.3
-        let cid_widths = Self::parse_cid_widths(cidfont_dict, base_font);
+        // Resolve /W reference if needed before parsing (common for large arrays)
+        let resolved_cidfont_dict = if let Some(w_obj) = cidfont_dict.get("W") {
+            if let Some(r) = w_obj.as_reference() {
+                match doc.load_object(r) {
+                    Ok(resolved) => {
+                        let mut dict_clone = cidfont_dict.clone();
+                        dict_clone.insert("W".to_string(), resolved);
+                        std::borrow::Cow::Owned(dict_clone)
+                    },
+                    Err(e) => {
+                        log::warn!("Font '{}': Failed to resolve /W reference: {}", base_font, e);
+                        std::borrow::Cow::Borrowed(cidfont_dict)
+                    },
+                }
+            } else {
+                std::borrow::Cow::Borrowed(cidfont_dict)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(cidfont_dict)
+        };
+        let cid_widths = Self::parse_cid_widths(&resolved_cidfont_dict, base_font);
 
         if cid_widths.is_some() {
             log::debug!(
@@ -1001,6 +1067,12 @@ impl FontInfo {
             None
         };
 
+        // Extract embedded font data from CIDFont's FontDescriptor.
+        // Per PDF spec, embedded font programs for Type0 fonts live on the
+        // CIDFont descendant's FontDescriptor, not on the Type0 wrapper.
+        let descendant_embedded =
+            Self::extract_embedded_font_from_descriptor(cidfont_dict, base_font, doc);
+
         Ok((
             cid_to_gid_map,
             cid_system_info,
@@ -1008,6 +1080,7 @@ impl FontInfo {
             cid_widths,
             cid_default_width,
             descendant_tt_cmap,
+            descendant_embedded,
         ))
     }
 
@@ -1066,6 +1139,220 @@ impl FontInfo {
         }
     }
 
+    /// Extract embedded font data from a font dictionary's /FontDescriptor.
+    /// Checks FontFile2 (TrueType), FontFile3 (CFF/OpenType), and FontFile (Type 1).
+    fn extract_embedded_font_from_descriptor(
+        font_dict: &HashMap<String, Object>,
+        base_font: &str,
+        doc: &PdfDocument,
+    ) -> Option<Arc<Vec<u8>>> {
+        let desc_obj = font_dict.get("FontDescriptor")?;
+        let desc = if let Some(r) = desc_obj.as_reference() {
+            doc.load_object(r).ok()?
+        } else {
+            desc_obj.clone()
+        };
+        let desc_dict = desc.as_dict()?;
+
+        // Try FontFile2 (TrueType), FontFile3 (CFF/OpenType), FontFile (Type 1)
+        let font_file_keys = ["FontFile2", "FontFile3", "FontFile"];
+        for key in &font_file_keys {
+            if let Some(ff_obj) = desc_dict.get(*key) {
+                let ff_ref = match ff_obj.as_reference() {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let ff_stream = match doc.load_object(ff_ref) {
+                    Ok(obj) => obj,
+                    Err(e) => {
+                        log::warn!(
+                            "Font '{}': Failed to load {} {:?}: {}",
+                            base_font,
+                            key,
+                            ff_ref,
+                            e
+                        );
+                        continue;
+                    },
+                };
+                let font_data = match doc.decode_stream_with_encryption(&ff_stream, ff_ref) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        log::warn!("Font '{}': Failed to decode {} stream: {}", base_font, key, e);
+                        continue;
+                    },
+                };
+                if !font_data.is_empty() {
+                    // If this is raw CFF data (FontFile3), wrap it in an OpenType
+                    // container so ttf-parser can parse it.
+                    let font_data = if *key == "FontFile3" && !font_data.is_empty()
+                        && font_data[0] == 1 // CFF version 1
+                        && font_data.len() > 4
+                    {
+                        log::info!(
+                            "Font '{}': Wrapping raw CFF in OpenType container ({} bytes)",
+                            base_font,
+                            font_data.len()
+                        );
+                        wrap_cff_in_opentype(&font_data)
+                    } else {
+                        font_data
+                    };
+                    log::info!(
+                        "Font '{}': Extracted embedded font from {} ({} bytes)",
+                        base_font,
+                        key,
+                        font_data.len()
+                    );
+                    return Some(Arc::new(font_data));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Wrap raw CFF font data in a minimal OpenType container so ttf-parser can parse it.
+/// Creates an OpenType font with `head` and `CFF ` tables (both required by ttf-parser).
+fn wrap_cff_in_opentype(cff_data: &[u8]) -> Vec<u8> {
+    let num_tables: u16 = 4; // CFF + head + hhea + maxp
+    let search_range: u16 = 32; // largest power of 2 <= numTables*16 = 64 → 32 (2 tables)
+    let entry_selector: u16 = 2;
+    let range_shift: u16 = (num_tables * 16) - search_range;
+
+    // Minimal head table (54 bytes) — OpenType spec required fields
+    let head_table: [u8; 54] = [
+        0x00, 0x01, 0x00, 0x00, // majorVersion=1, minorVersion=0
+        0x00, 0x01, 0x00, 0x00, // fontRevision=1.0
+        0x00, 0x00, 0x00, 0x00, // checksumAdjustment (0, will be ignored)
+        0x5F, 0x0F, 0x3C, 0xF5, // magicNumber
+        0x00, 0x0B, // flags (baseline at y=0, lsb at x=0, etc)
+        0x03, 0xE8, // unitsPerEm = 1000
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // created (0)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // modified (0)
+        0xFF, 0x38, // xMin = -200
+        0xFF, 0x38, // yMin = -200
+        0x03, 0xE8, // xMax = 1000
+        0x03, 0xE8, // yMax = 1000
+        0x00, 0x00, // macStyle
+        0x00, 0x08, // lowestRecPPEM = 8
+        0x00, 0x02, // fontDirectionHint
+        0x00, 0x01, // indexToLocFormat = 1 (long)
+        0x00, 0x00, // glyphDataFormat
+    ];
+
+    // Minimal hhea table (36 bytes)
+    let hhea_table: [u8; 36] = [
+        0x00, 0x01, 0x00, 0x00, // majorVersion=1, minorVersion=0
+        0x03, 0x20, // ascender = 800
+        0xFF, 0x38, // descender = -200
+        0x00, 0x00, // lineGap = 0
+        0x04, 0x00, // advanceWidthMax = 1024
+        0x00, 0x00, // minLeftSideBearing = 0
+        0x00, 0x00, // minRightSideBearing = 0
+        0x04, 0x00, // xMaxExtent = 1024
+        0x00, 0x01, // caretSlopeRise = 1
+        0x00, 0x00, // caretSlopeRun = 0
+        0x00, 0x00, // caretOffset = 0
+        0x00, 0x00, // reserved
+        0x00, 0x00, // reserved
+        0x00, 0x00, // reserved
+        0x00, 0x00, // reserved
+        0x00, 0x00, // metricDataFormat = 0
+        0x01, 0x00, // numberOfHMetrics = 256
+    ];
+
+    // Minimal maxp table (6 bytes for CFF fonts — version 0.5)
+    let maxp_table: [u8; 6] = [
+        0x00, 0x00, 0x50, 0x00, // version = 0.5 (CFF)
+        0x01, 0x00, // numGlyphs = 256
+    ];
+
+    // Layout: offset table (12) + 4 table records (64) = 76 bytes header
+    let header_size: u32 = 12 + (num_tables as u32) * 16;
+    // Place tables: head, hhea, maxp, CFF (alphabetical by tag within each group)
+    let head_offset = (header_size + 3) & !3;
+    let head_len = head_table.len() as u32;
+    let hhea_offset = ((head_offset + head_len) + 3) & !3;
+    let hhea_len = hhea_table.len() as u32;
+    let maxp_offset = ((hhea_offset + hhea_len) + 3) & !3;
+    let maxp_len = maxp_table.len() as u32;
+    let cff_offset = ((maxp_offset + maxp_len) + 3) & !3;
+    let cff_len = cff_data.len() as u32;
+
+    fn table_checksum(data: &[u8]) -> u32 {
+        let mut sum: u32 = 0;
+        for chunk in data.chunks(4) {
+            let mut bytes = [0u8; 4];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            sum = sum.wrapping_add(u32::from_be_bytes(bytes));
+        }
+        sum
+    }
+
+    let mut out = Vec::with_capacity((cff_offset + cff_len) as usize);
+
+    // Offset table (12 bytes)
+    out.extend_from_slice(b"OTTO");
+    out.extend_from_slice(&num_tables.to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&entry_selector.to_be_bytes());
+    out.extend_from_slice(&range_shift.to_be_bytes());
+
+    // Table record: CFF (alphabetical order: CFF before head)
+    out.extend_from_slice(b"CFF ");
+    out.extend_from_slice(&table_checksum(cff_data).to_be_bytes());
+    out.extend_from_slice(&cff_offset.to_be_bytes());
+    out.extend_from_slice(&cff_len.to_be_bytes());
+
+    // Table record: head
+    out.extend_from_slice(b"head");
+    out.extend_from_slice(&table_checksum(&head_table).to_be_bytes());
+    out.extend_from_slice(&head_offset.to_be_bytes());
+    out.extend_from_slice(&head_len.to_be_bytes());
+
+    // Table record: hhea
+    out.extend_from_slice(b"hhea");
+    out.extend_from_slice(&table_checksum(&hhea_table).to_be_bytes());
+    out.extend_from_slice(&hhea_offset.to_be_bytes());
+    out.extend_from_slice(&hhea_len.to_be_bytes());
+
+    // Table record: maxp
+    out.extend_from_slice(b"maxp");
+    out.extend_from_slice(&table_checksum(&maxp_table).to_be_bytes());
+    out.extend_from_slice(&maxp_offset.to_be_bytes());
+    out.extend_from_slice(&maxp_len.to_be_bytes());
+
+    // head table data
+    while out.len() < head_offset as usize {
+        out.push(0);
+    }
+    out.extend_from_slice(&head_table);
+
+    // hhea table data
+    while out.len() < hhea_offset as usize {
+        out.push(0);
+    }
+    out.extend_from_slice(&hhea_table);
+
+    // maxp table data
+    while out.len() < maxp_offset as usize {
+        out.push(0);
+    }
+    out.extend_from_slice(&maxp_table);
+
+    // Pad to CFF offset
+    while out.len() < cff_offset as usize {
+        out.push(0);
+    }
+
+    // CFF data
+    out.extend_from_slice(cff_data);
+
+    out
+}
+
+impl FontInfo {
     /// Parse CIDFont /W array for glyph widths.
     ///
     /// Per PDF Spec ISO 32000-1:2008, Section 9.7.4.3, the /W array has two formats:
@@ -1493,7 +1780,197 @@ impl FontInfo {
                 }
             }
         }
+        // For standard 14 fonts without /Widths, use built-in metrics
+        if let Some(w) = self.get_standard_font_width(char_code) {
+            return w;
+        }
         self.default_width
+    }
+
+    /// Look up width from standard 14 font metrics when /Widths array is absent.
+    fn get_standard_font_width(&self, char_code: u16) -> Option<f32> {
+        // Only apply for standard 14 fonts (no embedded data, no widths array)
+        if self.widths.is_some() || self.embedded_font_data.is_some() {
+            return None;
+        }
+        let name = &self.base_font;
+        let is_times = name.contains("Times");
+        let is_helvetica = name.contains("Helvetica") || name.contains("Arial");
+        let is_courier = name.contains("Courier");
+
+        if !is_times && !is_helvetica && !is_courier {
+            return None;
+        }
+
+        if is_courier {
+            return Some(600.0); // Monospace
+        }
+
+        let code = char_code as u8;
+        // Times-Roman standard widths (most common chars, PDF spec Appendix D)
+        if is_times {
+            return Some(match code {
+                32 => 250.0,
+                33 => 333.0,
+                34 => 408.0,
+                35 => 500.0,
+                36 => 500.0,
+                37 => 833.0,
+                38 => 778.0,
+                39 => 333.0,
+                40 => 333.0,
+                41 => 333.0,
+                42 => 500.0,
+                43 => 564.0,
+                44 => 250.0,
+                45 => 333.0,
+                46 => 250.0,
+                47 => 278.0,
+                48 => 500.0,
+                49 => 500.0,
+                50 => 500.0,
+                51 => 500.0,
+                52 => 500.0,
+                53 => 500.0,
+                54 => 500.0,
+                55 => 500.0,
+                56 => 500.0,
+                57 => 500.0,
+                58 => 278.0,
+                59 => 278.0,
+                60 => 564.0,
+                61 => 564.0,
+                62 => 564.0,
+                63 => 444.0,
+                64 => 921.0,
+                65 => 722.0,
+                66 => 667.0,
+                67 => 667.0,
+                68 => 722.0,
+                69 => 611.0,
+                70 => 556.0,
+                71 => 722.0,
+                72 => 722.0,
+                73 => 333.0,
+                74 => 389.0,
+                75 => 722.0,
+                76 => 611.0,
+                77 => 889.0,
+                78 => 722.0,
+                79 => 722.0,
+                80 => 556.0,
+                81 => 722.0,
+                82 => 667.0,
+                83 => 556.0,
+                84 => 611.0,
+                85 => 722.0,
+                86 => 722.0,
+                87 => 944.0,
+                88 => 722.0,
+                89 => 722.0,
+                90 => 611.0,
+                91 => 333.0,
+                92 => 278.0,
+                93 => 333.0,
+                97 => 444.0,
+                98 => 500.0,
+                99 => 444.0,
+                100 => 500.0,
+                101 => 444.0,
+                102 => 333.0,
+                103 => 500.0,
+                104 => 500.0,
+                105 => 278.0,
+                106 => 278.0,
+                107 => 500.0,
+                108 => 278.0,
+                109 => 778.0,
+                110 => 500.0,
+                111 => 500.0,
+                112 => 500.0,
+                113 => 500.0,
+                114 => 333.0,
+                115 => 389.0,
+                116 => 278.0,
+                117 => 500.0,
+                118 => 500.0,
+                119 => 722.0,
+                120 => 500.0,
+                121 => 500.0,
+                122 => 444.0,
+                _ => return None,
+            });
+        }
+
+        // Helvetica standard widths
+        if is_helvetica {
+            return Some(match code {
+                32 => 278.0,
+                33 => 278.0,
+                34 => 355.0,
+                44 => 278.0,
+                45 => 333.0,
+                46 => 278.0,
+                47 => 278.0,
+                48..=57 => 556.0, // digits
+                58 => 278.0,
+                59 => 278.0,
+                65 => 667.0,
+                66 => 667.0,
+                67 => 722.0,
+                68 => 722.0,
+                69 => 667.0,
+                70 => 611.0,
+                71 => 778.0,
+                72 => 722.0,
+                73 => 278.0,
+                74 => 500.0,
+                75 => 667.0,
+                76 => 556.0,
+                77 => 833.0,
+                78 => 722.0,
+                79 => 778.0,
+                80 => 667.0,
+                81 => 778.0,
+                82 => 722.0,
+                83 => 667.0,
+                84 => 611.0,
+                85 => 722.0,
+                86 => 667.0,
+                87 => 944.0,
+                88 => 667.0,
+                89 => 667.0,
+                90 => 611.0,
+                97 => 556.0,
+                98 => 556.0,
+                99 => 500.0,
+                100 => 556.0,
+                101 => 556.0,
+                102 => 278.0,
+                103 => 556.0,
+                104 => 556.0,
+                105 => 222.0,
+                106 => 222.0,
+                107 => 500.0,
+                108 => 222.0,
+                109 => 833.0,
+                110 => 556.0,
+                111 => 556.0,
+                112 => 556.0,
+                113 => 556.0,
+                114 => 333.0,
+                115 => 500.0,
+                116 => 278.0,
+                117 => 556.0,
+                118 => 500.0,
+                119 => 722.0,
+                120 => 500.0,
+                121 => 500.0,
+                122 => 444.0,
+                _ => return None,
+            });
+        }
+        None
     }
 
     /// Get the width of the space glyph (U+0020) in font units.
@@ -1538,7 +2015,7 @@ impl FontInfo {
     /// assert_eq!(FontInfo::gid_to_standard_glyph_name(0x20), Some("space"));
     /// assert_eq!(FontInfo::gid_to_standard_glyph_name(0xFFFF), None);
     /// ```
-    fn gid_to_standard_glyph_name(gid: u16) -> Option<&'static str> {
+    pub fn gid_to_standard_glyph_name(gid: u16) -> Option<&'static str> {
         // Map GIDs to standard PostScript glyph names across multiple ranges:
         // - ASCII printable range (0x20-0x7E)
         // - Extended Latin / Windows-1252 range (0x80-0xFF)
@@ -1850,9 +2327,11 @@ impl FontInfo {
 
     /// Convert a character code to Unicode string.
     ///
-    /// This method looks up the character code in the font's encoding tables
-    /// (ToUnicode CMap, built-in encoding, or glyph name mappings) and returns
-    /// the corresponding Unicode string if found.
+    /// Returns the faithful Unicode mapping per PDF Spec §9.10.2. Ligature
+    /// characters (U+FB00–FB06) are preserved here; expansion into component
+    /// letters is done by the text pipeline via `LigatureDecisionMaker`, which
+    /// inspects surrounding context (neighboring chars, word boundaries) to
+    /// decide whether to split — keeping font_dict a pure encoding layer.
     pub fn char_to_unicode(&self, char_code: u32) -> Option<String> {
         // char_code is now u32 to support 4-byte character codes (0x00000000-0xFFFFFFFF)
         // This is backward compatible - u16 values are automatically promoted to u32
@@ -1860,78 +2339,75 @@ impl FontInfo {
         // ==================================================================================
         // PRIORITY 1: ToUnicode CMap (PDF Spec Section 9.10.2, Method 1)
         // ==================================================================================
-        // "If the font dictionary contains a ToUnicode CMap, use that CMap to convert
-        // the character code to Unicode."
-        //
-        // QUALITY HEURISTIC: Skip U+FFFD (replacement character) mappings.
-        // Some PDF authoring tools write U+FFFD in ToUnicode CMaps when they can't
-        // determine the correct Unicode value. This is effectively saying "I don't know".
-        // We treat U+FFFD mappings the same as missing entries and fall back to Priority 2.
-        //
-        // This matches industry practice (PyMuPDF) and fixes 57 PDFs (16%) with en-dash issues.
-        // See ENDASH_ISSUE_ROOT_CAUSE.md for full analysis.
-        //
-        // Phase 5.1: With lazy loading, the CMap is parsed on first access here
         if let Some(lazy_cmap) = &self.to_unicode {
-            // Get the parsed CMap - this triggers lazy parsing on first access
             if let Some(cmap) = lazy_cmap.get() {
                 if let Some(unicode) = cmap.get(&char_code) {
-                    // Skip U+FFFD mappings - treat as missing entry
                     if unicode == "\u{FFFD}" {
                         log::warn!(
                             "ToUnicode CMap has U+FFFD for code 0x{:02X} in font '{}' - falling back to Priority 2",
-                            char_code,
-                            self.base_font
+                            char_code, self.base_font
                         );
-                        // Fall through to Priority 2 (predefined encodings)
                     } else if unicode
                         .chars()
                         .all(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
                         && !unicode.is_empty()
                     {
-                        // ToUnicode mapped to control characters (U+0000-U+001F excluding
-                        // whitespace). This is a broken CMap — fall through to glyph name
-                        // resolution or other fallbacks.
                         log::warn!(
                             "ToUnicode CMap maps code 0x{:04X} to control char(s) in font '{}' - falling back",
-                            char_code,
-                            self.base_font
+                            char_code, self.base_font
                         );
-                        // Fall through to Priority 2
                     } else {
-                        log::debug!(
-                            "ToUnicode CMap: font='{}' code=0x{:02X} → '{}'",
-                            self.base_font,
-                            char_code,
-                            unicode
-                        );
                         return Some(unicode.clone());
                     }
                 } else {
-                    // DIAGNOSTIC: Log when ToUnicode CMap exists but lookup fails
-                    log::warn!(
+                    log::debug!(
                         "ToUnicode CMap MISS: font='{}' subtype='{}' code=0x{:04X} (cmap has {} entries)",
-                        self.base_font,
-                        self.subtype,
-                        char_code,
-                        cmap.len()
+                        self.base_font, self.subtype, char_code, cmap.len()
                     );
+
+                    // #363: subset Type0 + Identity-H + Adobe-Identity ordering.
+                    // The font's CIDs are insertion-ordered and have no relation
+                    // to Unicode code points, so the Priority 2 Identity-H
+                    // CID-as-Unicode fallback (`char::from_u32(cid)`) produces
+                    // ASCII-shifted ciphertext (e.g. `%B+$%8A` on nougat_035.pdf).
+                    // Per ISO 32000-1 §9.10.2, a present ToUnicode CMap is the
+                    // authoritative char→Unicode mapping; a miss means the
+                    // glyph has no Unicode equivalent, so return U+FFFD rather
+                    // than fall through.
+                    //
+                    // Narrow on purpose: simple fonts (Type1/TrueType with
+                    // standard encoding) still fall through — their encoding
+                    // is a real mapping. CJK Type0 (Adobe-GB1/Japan1/etc.) also
+                    // falls through to the predefined-CMap path.
+                    if self.subtype == "Type0" {
+                        let is_identity_encoding = matches!(
+                            &self.encoding,
+                            Encoding::Standard(name) if name == "Identity-H" || name == "Identity-V"
+                        ) || matches!(
+                            &self.encoding,
+                            Encoding::Identity
+                        );
+                        let is_identity_ordering = self
+                            .cid_system_info
+                            .as_ref()
+                            .map(|info| info.ordering == "Identity")
+                            .unwrap_or(false);
+                        if is_identity_encoding && is_identity_ordering {
+                            return Some("\u{FFFD}".to_string());
+                        }
+                    }
                 }
             } else {
-                // Lazy CMap parsing failed
                 log::warn!(
                     "Failed to parse lazy CMap for font '{}' - will fall back to Priority 2",
                     self.base_font
                 );
             }
-        } else {
-            // DIAGNOSTIC: Log when ToUnicode CMap is missing
-            if self.subtype == "Type0" {
-                log::warn!(
-                    "Type0 font '{}' missing ToUnicode CMap! This will cause character scrambling.",
-                    self.base_font
-                );
-            }
+        } else if self.subtype == "Type0" {
+            log::debug!(
+                "Type0 font '{}' missing ToUnicode CMap - will fall back to Priority 2",
+                self.base_font
+            );
         }
 
         // ==================================================================================
@@ -2101,33 +2577,6 @@ impl FontInfo {
                     return Some(unicode_char.to_string());
                 }
             }
-        }
-
-        // ==================================================================================
-        // PRIORITY 1.5: Ligature Expansion (Unicode Ligature Characters)
-        // ==================================================================================
-        // Check if this character code is a Unicode ligature character (U+FB00-U+FB04).
-        // Ligatures should be expanded to their component characters for better text extraction.
-        //
-        // This is placed early (after ToUnicode but before other fallbacks) because:
-        // - Some PDFs may map ligature character codes through ToUnicode CMaps
-        // - If no ToUnicode mapping exists, we still want to expand ligatures
-        // - Ligature expansion is a Unicode standard (ISO 32000-1:2008 Section 9.10)
-        //
-        // Ligatures supported:
-        // - U+FB00: ff (LATIN SMALL LIGATURE FF)
-        // - U+FB01: fi (LATIN SMALL LIGATURE FI)
-        // - U+FB02: fl (LATIN SMALL LIGATURE FL)
-        // - U+FB03: ffi (LATIN SMALL LIGATURE FFI)
-        // - U+FB04: ffl (LATIN SMALL LIGATURE FFL)
-        if let Some(expanded) = expand_ligature_char_code(char_code as u16) {
-            log::debug!(
-                "Ligature expansion: font='{}' code=0x{:04X} → '{}'",
-                self.base_font,
-                char_code,
-                expanded
-            );
-            return Some(expanded.to_string());
         }
 
         // ==================================================================================
@@ -2447,6 +2896,29 @@ impl FontInfo {
             self.is_symbolic(),
             self.encoding
         );
+
+        // ==================================================================================
+        // PRIORITY 6: Unicode Ligature Fallback
+        // ==================================================================================
+        // If no encoding mapping was found and the raw character code falls
+        // in the Unicode ligature block (U+FB00-U+FB06), decompose into the
+        // component letters. This is a pure-fallback codepath — when no
+        // font data identifies the glyph, standard ligature decomposition
+        // is the safest recovery. LaTeX and scientific PDF producers emit
+        // these codes directly.
+        let ligature_components = match char_code {
+            0xFB00 => Some("ff"),
+            0xFB01 => Some("fi"),
+            0xFB02 => Some("fl"),
+            0xFB03 => Some("ffi"),
+            0xFB04 => Some("ffl"),
+            0xFB05 | 0xFB06 => Some("st"),
+            _ => None,
+        };
+        if let Some(s) = ligature_components {
+            return Some(s.to_string());
+        }
+
         None
     }
 
@@ -2564,6 +3036,23 @@ impl FontInfo {
     /// ```
     pub fn is_bold(&self) -> bool {
         self.get_font_weight().is_bold()
+    }
+
+    /// Return true when this font's per-glyph widths come from the PDF's
+    /// `/Widths` array (for simple fonts) or `/W` array (for Type0/CID
+    /// fonts), rather than from the generic 500/550/600-thousandths-of-em
+    /// fallback that `FontInfo::new` uses when neither is present.
+    ///
+    /// Callers use this to decide whether `byte_to_width_table` is
+    /// trustworthy: when it returns false, every glyph reports the same
+    /// fallback advance, so bounding-box widths computed from those
+    /// advances systematically over- or under-estimate the visible text
+    /// extent. On affected PDFs that collapses the real gap between
+    /// adjacent `Tj`-positioned words, gluing words together in
+    /// `extract_text` output even though the PDF itself places them on
+    /// distinct positions. See issue #328.
+    pub fn has_explicit_widths(&self) -> bool {
+        self.widths.is_some() || self.cid_widths.is_some()
     }
 
     /// Check if this font is likely italic based on the font name.
@@ -2972,25 +3461,6 @@ fn expand_ligature_char(c: char) -> Option<&'static str> {
 /// The expanded string if `char_code` is a ligature, None otherwise.
 ///
 /// # Examples
-///
-/// ```ignore
-/// assert_eq!(FontInfo::expand_ligature_char_code(0xFB01), Some("fi"));
-/// assert_eq!(FontInfo::expand_ligature_char_code(0xFB02), Some("fl"));
-/// assert_eq!(FontInfo::expand_ligature_char_code(0x0041), None); // 'A'
-/// ```
-fn expand_ligature_char_code(char_code: u16) -> Option<&'static str> {
-    match char_code {
-        0xFB00 => Some("ff"),  // LATIN SMALL LIGATURE FF
-        0xFB01 => Some("fi"),  // LATIN SMALL LIGATURE FI
-        0xFB02 => Some("fl"),  // LATIN SMALL LIGATURE FL
-        0xFB03 => Some("ffi"), // LATIN SMALL LIGATURE FFI
-        0xFB04 => Some("ffl"), // LATIN SMALL LIGATURE FFL
-        0xFB05 => Some("st"),  // LATIN SMALL LIGATURE LONG S T
-        0xFB06 => Some("st"),  // LATIN SMALL LIGATURE ST
-        _ => None,
-    }
-}
-
 /// Look up a character in the Adobe Symbol font encoding.
 ///
 /// This function implements the Symbol font encoding table as defined in
@@ -3770,6 +4240,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -3796,6 +4267,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -3825,6 +4297,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -3851,6 +4324,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -3883,6 +4357,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -3916,6 +4391,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -3948,6 +4424,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -3978,6 +4455,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4106,6 +4584,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4224,6 +4703,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4260,6 +4740,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4289,6 +4770,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4322,6 +4804,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4351,6 +4834,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4380,6 +4864,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4413,6 +4898,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4442,6 +4928,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4471,6 +4958,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4504,6 +4992,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4532,6 +5021,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4560,6 +5050,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4588,6 +5079,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4616,6 +5108,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4644,6 +5137,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4672,6 +5166,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4700,6 +5195,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -4728,6 +5224,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -5004,6 +5501,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: Some(cid_widths),
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -5044,6 +5542,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: Some(cid_widths),
             cid_default_width: 800.0, // CID default width
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -5080,6 +5579,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -5126,6 +5626,7 @@ mod tests {
             cid_font_type: Some("CIDFontType2".to_string()),
             cid_widths: Some(cid_widths),
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -5168,6 +5669,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             byte_to_width_table: std::sync::OnceLock::new(),
@@ -5692,23 +6194,6 @@ mod tests {
     }
 
     // =========================================================================
-    // expand_ligature_char_code
-    // =========================================================================
-
-    #[test]
-    fn test_expand_ligature_char_code_all_variants() {
-        assert_eq!(expand_ligature_char_code(0xFB00), Some("ff"));
-        assert_eq!(expand_ligature_char_code(0xFB01), Some("fi"));
-        assert_eq!(expand_ligature_char_code(0xFB02), Some("fl"));
-        assert_eq!(expand_ligature_char_code(0xFB03), Some("ffi"));
-        assert_eq!(expand_ligature_char_code(0xFB04), Some("ffl"));
-        assert_eq!(expand_ligature_char_code(0xFB05), Some("st"));
-        assert_eq!(expand_ligature_char_code(0xFB06), Some("st"));
-        assert_eq!(expand_ligature_char_code(0x0041), None);
-        assert_eq!(expand_ligature_char_code(0x0000), None);
-    }
-
-    // =========================================================================
     // get_glyph_width — simple font widths array
     // =========================================================================
 
@@ -5915,14 +6400,13 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_char_to_unicode_ligature_expansion() {
-        // Ligature codes come through when no ToUnicode and not in encoding
+    fn test_char_to_unicode_ligature_fallback_expansion() {
+        // When no encoding/ToUnicode mapping exists, Priority 6 falls back
+        // to standard Unicode ligature decomposition (U+FB00–FB06 → components).
         let font = make_font(|f| {
             f.encoding = Encoding::Standard("WinAnsiEncoding".to_string());
         });
-        // 0xFB01 (fi ligature) should expand to "fi"
         assert_eq!(font.char_to_unicode(0xFB01), Some("fi".to_string()));
-        // 0xFB03 (ffi ligature) should expand to "ffi"
         assert_eq!(font.char_to_unicode(0xFB03), Some("ffi".to_string()));
     }
 
@@ -6606,5 +7090,194 @@ mod tests {
         assert_eq!(standard_encoding_lookup("WinAnsiEncoding", 0x99), Some("\u{2122}".to_string()));
         // 0xFF → Latin small letter y with diaeresis
         assert_eq!(standard_encoding_lookup("WinAnsiEncoding", 0xFF), Some("\u{00FF}".to_string()));
+    }
+
+    // ==========================================
+    // wrap_cff_in_opentype tests
+    // ==========================================
+
+    #[test]
+    fn test_wrap_cff_in_opentype_header() {
+        // Minimal CFF data (version 1.0, hdrSize=4, offSize=1)
+        let cff = vec![1, 0, 4, 1, 0, 0, 0, 0];
+        let otf = super::wrap_cff_in_opentype(&cff);
+
+        // Must start with 'OTTO' tag
+        assert_eq!(&otf[0..4], b"OTTO");
+        // numTables = 4 (CFF, head, hhea, maxp)
+        assert_eq!(u16::from_be_bytes([otf[4], otf[5]]), 4);
+        // Must contain the CFF data at some offset
+        assert!(otf.windows(cff.len()).any(|w| w == &cff[..]));
+    }
+
+    #[test]
+    fn test_wrap_cff_in_opentype_contains_required_tables() {
+        let cff = vec![1, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let otf = super::wrap_cff_in_opentype(&cff);
+
+        // Check all 4 required table tags exist in the table directory
+        // Table directory starts at offset 12, each record is 16 bytes
+        let mut found_tables = Vec::new();
+        for i in 0..4 {
+            let offset = 12 + i * 16;
+            let tag = std::str::from_utf8(&otf[offset..offset + 4]).unwrap_or("????");
+            found_tables.push(tag.to_string());
+        }
+        found_tables.sort();
+        assert_eq!(found_tables, vec!["CFF ", "head", "hhea", "maxp"]);
+    }
+
+    #[test]
+    fn test_wrap_cff_in_opentype_parseable() {
+        // Create a minimal but valid CFF font stub
+        let cff = vec![1, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let otf = super::wrap_cff_in_opentype(&cff);
+
+        // ttf-parser should be able to parse the header (head + hhea + maxp)
+        // without panicking, even if CFF data is minimal
+        let result = ttf_parser::Face::parse(&otf, 0);
+        // May fail on CFF content but should not panic on table parsing
+        // The fact that it doesn't panic is the test
+        let _ = result;
+    }
+
+    // ==========================================
+    // get_standard_font_width tests
+    // ==========================================
+
+    #[test]
+    fn test_standard_font_width_times_roman() {
+        let font = FontInfo {
+            base_font: "Times-Roman".to_string(),
+            subtype: "Type1".to_string(),
+            encoding: Encoding::Standard("WinAnsiEncoding".to_string()),
+            to_unicode: None,
+            font_weight: None,
+            flags: None,
+            stem_v: None,
+            embedded_font_data: None,
+            truetype_cmap: std::sync::OnceLock::new(),
+            is_truetype_font: false,
+            cid_to_gid_map: None,
+            cid_system_info: None,
+            cid_font_type: None,
+            widths: None, // No widths → should use standard metrics
+            first_char: None,
+            last_char: None,
+            default_width: 500.0,
+            cid_widths: None,
+            cid_default_width: 1000.0,
+            cff_gid_map: None,
+            multi_char_map: HashMap::new(),
+            byte_to_char_table: std::sync::OnceLock::new(),
+            byte_to_width_table: std::sync::OnceLock::new(),
+        };
+
+        // 'A' = 722 in Times-Roman (not the default 500)
+        assert_eq!(font.get_glyph_width(65), 722.0);
+        // 'i' = 278 (narrow)
+        assert_eq!(font.get_glyph_width(105), 278.0);
+        // space = 250
+        assert_eq!(font.get_glyph_width(32), 250.0);
+        // 'm' = 778 (wide)
+        assert_eq!(font.get_glyph_width(109), 778.0);
+    }
+
+    #[test]
+    fn test_standard_font_width_courier_monospace() {
+        let font = FontInfo {
+            base_font: "Courier".to_string(),
+            subtype: "Type1".to_string(),
+            encoding: Encoding::Standard("WinAnsiEncoding".to_string()),
+            to_unicode: None,
+            font_weight: None,
+            flags: None,
+            stem_v: None,
+            embedded_font_data: None,
+            truetype_cmap: std::sync::OnceLock::new(),
+            is_truetype_font: false,
+            cid_to_gid_map: None,
+            cid_system_info: None,
+            cid_font_type: None,
+            widths: None,
+            first_char: None,
+            last_char: None,
+            default_width: 500.0,
+            cid_widths: None,
+            cid_default_width: 1000.0,
+            cff_gid_map: None,
+            multi_char_map: HashMap::new(),
+            byte_to_char_table: std::sync::OnceLock::new(),
+            byte_to_width_table: std::sync::OnceLock::new(),
+        };
+
+        // Courier is monospace — all chars 600
+        assert_eq!(font.get_glyph_width(65), 600.0); // A
+        assert_eq!(font.get_glyph_width(105), 600.0); // i
+        assert_eq!(font.get_glyph_width(32), 600.0); // space
+    }
+
+    #[test]
+    fn test_standard_font_width_not_applied_with_widths_array() {
+        let font = FontInfo {
+            base_font: "Times-Roman".to_string(),
+            subtype: "Type1".to_string(),
+            encoding: Encoding::Standard("WinAnsiEncoding".to_string()),
+            to_unicode: None,
+            font_weight: None,
+            flags: None,
+            stem_v: None,
+            embedded_font_data: None,
+            truetype_cmap: std::sync::OnceLock::new(),
+            is_truetype_font: false,
+            cid_to_gid_map: None,
+            cid_system_info: None,
+            cid_font_type: None,
+            widths: Some(vec![999.0]), // Has explicit widths
+            first_char: Some(65),      // Starting at 'A'
+            last_char: Some(65),
+            default_width: 500.0,
+            cid_widths: None,
+            cid_default_width: 1000.0,
+            cff_gid_map: None,
+            multi_char_map: HashMap::new(),
+            byte_to_char_table: std::sync::OnceLock::new(),
+            byte_to_width_table: std::sync::OnceLock::new(),
+        };
+
+        // Should use explicit width (999), not standard Times width (722)
+        assert_eq!(font.get_glyph_width(65), 999.0);
+    }
+
+    #[test]
+    fn test_standard_font_width_not_applied_to_unknown_font() {
+        let font = FontInfo {
+            base_font: "MyCustomFont".to_string(),
+            subtype: "Type1".to_string(),
+            encoding: Encoding::Standard("WinAnsiEncoding".to_string()),
+            to_unicode: None,
+            font_weight: None,
+            flags: None,
+            stem_v: None,
+            embedded_font_data: None,
+            truetype_cmap: std::sync::OnceLock::new(),
+            is_truetype_font: false,
+            cid_to_gid_map: None,
+            cid_system_info: None,
+            cid_font_type: None,
+            widths: None,
+            first_char: None,
+            last_char: None,
+            default_width: 500.0,
+            cid_widths: None,
+            cid_default_width: 1000.0,
+            cff_gid_map: None,
+            multi_char_map: HashMap::new(),
+            byte_to_char_table: std::sync::OnceLock::new(),
+            byte_to_width_table: std::sync::OnceLock::new(),
+        };
+
+        // Unknown font → should fall back to default_width (500)
+        assert_eq!(font.get_glyph_width(65), 500.0);
     }
 }

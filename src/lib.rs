@@ -11,6 +11,7 @@
 #![allow(clippy::regex_creation_in_loops)]
 #![allow(clippy::manual_find)]
 #![allow(clippy::match_like_matches_macro)]
+#![allow(clippy::collapsible_match)]
 // Allow unused for tests
 #![cfg_attr(test, allow(dead_code))]
 #![cfg_attr(test, allow(unused_variables))]
@@ -89,6 +90,7 @@
 //! ```ignore
 //! use pdf_oxide::PdfDocument;
 //! use pdf_oxide::pipeline::{TextPipeline, TextPipelineConfig};
+//! use pdf_oxide::pipeline::converters::OutputConverter;
 //! use pdf_oxide::pipeline::converters::MarkdownOutputConverter;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -135,6 +137,9 @@
 // Error handling
 pub mod error;
 
+// General-purpose caching utilities
+pub(crate) mod cache;
+
 // Core PDF parsing
 pub mod document;
 pub mod lexer;
@@ -148,6 +153,9 @@ pub mod xref_reconstruction;
 
 // Stream decoders
 pub mod decoders;
+
+// Colour management (ICC profile handling)
+pub mod color;
 
 // Encryption support
 pub mod encryption;
@@ -237,6 +245,10 @@ pub mod hybrid;
 #[cfg_attr(docsrs, doc(cfg(feature = "ocr")))]
 pub mod ocr;
 
+// C FFI for Go, Node.js, C# bindings (not available on wasm32)
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ffi;
+
 // Python bindings (optional)
 #[cfg(feature = "python")]
 mod python;
@@ -255,14 +267,18 @@ pub use annotation_types::{
 };
 pub use annotations::{Annotation, LinkAction, LinkDestination};
 pub use config::{DocumentType, ExtractionProfile};
-pub use document::{ExtractedImageRef, ImageFormat, PdfDocument};
+pub use document::{ExtractedImageRef, ImageFormat, PdfDocument, ReadingOrder};
 pub use error::{Error, Result};
+pub use layout::PageText;
 pub use outline::{Destination, OutlineItem};
 
 // Global font cache for batch processing
 pub use fonts::global_cache::{
     clear_global_font_cache, global_font_cache_stats, set_global_font_cache_capacity,
 };
+
+// Global CMap cache management
+pub use fonts::cmap::{clear_cmap_cache, cmap_cache_size};
 
 #[cfg(feature = "parallel")]
 pub use parallel::{extract_all_markdown_parallel, extract_all_text_parallel, ParallelExtractor};
@@ -272,6 +288,82 @@ pub(crate) mod utils {
     //! Internal utility functions for the library.
 
     use std::cmp::Ordering;
+
+    /// Safely truncate a string to at most `max_bytes` from the start
+    /// without splitting a multi-byte UTF-8 character.
+    ///
+    /// Returns the full string if it is shorter than `max_bytes`.
+    /// When truncation lands inside a multi-byte character, the boundary
+    /// is rounded **down** to the nearest char boundary (floor).
+    #[inline]
+    pub fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+        if s.len() <= max_bytes {
+            return s;
+        }
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    /// Safely take the last `max_bytes` of a string without splitting
+    /// a multi-byte UTF-8 character.
+    ///
+    /// Returns the full string if it is shorter than `max_bytes`.
+    /// When the computed start offset lands inside a multi-byte character,
+    /// the boundary is rounded **up** to the nearest char boundary (ceil).
+    #[inline]
+    pub fn safe_suffix(s: &str, max_bytes: usize) -> &str {
+        if s.len() <= max_bytes {
+            return s;
+        }
+        let start = s.len() - max_bytes;
+        let mut safe_start = start;
+        while safe_start < s.len() && !s.is_char_boundary(safe_start) {
+            safe_start += 1;
+        }
+        &s[safe_start..]
+    }
+
+    /// Y-band tolerance used by `row_aware_span_cmp`.
+    ///
+    /// Two spans whose top-Y differs by less than this amount are treated
+    /// as lying on the same row. Chosen to absorb typographic baseline
+    /// jitter for 10-12pt body text and glyph-cluster offsets in CJK
+    /// fonts without merging adjacent 14pt-leading lines.
+    pub const ROW_BAND_TOLERANCE_PT: f32 = 3.0;
+
+    /// Row-aware reading-order comparator for spans.
+    ///
+    /// Sorts primarily by "row band" (top-Y quantized to
+    /// `ROW_BAND_TOLERANCE_PT`, larger Y first per PDF Spec ISO 32000-1:2008
+    /// §8.3.2.3) and secondarily by X (left-to-right within a row). This
+    /// keeps tabular layouts where cells in the same logical row have
+    /// slightly different Y values (font-metric jitter, superscripts, CJK
+    /// glyph centering) from being interleaved by a strict Y sort.
+    ///
+    /// Uses `i32` band keys so the ordering is a valid total order —
+    /// comparing raw Y values with tolerance is non-transitive and would
+    /// break `sort_by`.
+    #[inline]
+    pub fn row_aware_span_cmp(a_y: f32, a_x: f32, b_y: f32, b_x: f32) -> Ordering {
+        // Non-finite Y (NaN/±Inf) cannot be quantized into an i32 band —
+        // `as i32` saturates, collapsing distinct non-finite values into
+        // the same band and reordering them unpredictably against finite
+        // spans. Fall back to `safe_float_cmp` so non-finite values follow
+        // the same NaN-last / total-order policy used everywhere else.
+        if !a_y.is_finite() || !b_y.is_finite() {
+            return safe_float_cmp(b_y, a_y).then_with(|| safe_float_cmp(a_x, b_x));
+        }
+        let band_a = (a_y / ROW_BAND_TOLERANCE_PT).round() as i32;
+        let band_b = (b_y / ROW_BAND_TOLERANCE_PT).round() as i32;
+        // Larger Y = higher on page → descending band order.
+        match band_b.cmp(&band_a) {
+            Ordering::Equal => safe_float_cmp(a_x, b_x),
+            other => other,
+        }
+    }
 
     /// Safely compare two floating point numbers, handling NaN cases.
     ///
@@ -359,6 +451,88 @@ pub(crate) mod utils {
             assert_eq!(safe_float_cmp(a, nan), Ordering::Less);
         }
 
+        /// Cells in the same tabular row with slightly-different Y values
+        /// must stay together and be ordered by X, not interleaved with
+        /// cells from other rows.
+        #[test]
+        fn test_row_aware_span_cmp_tolerates_y_jitter() {
+            // Row 1 at y ≈ 100 with small per-cell jitter.
+            // Row 2 at y ≈ 86 (14pt leading below).
+            // A strict Y sort would interleave them because some row-1
+            // cells have lower Y than some row-2 cells.
+            #[derive(Debug, Clone, Copy)]
+            struct Cell {
+                y: f32,
+                x: f32,
+                id: &'static str,
+            }
+            let mut cells = [
+                Cell {
+                    y: 100.5,
+                    x: 50.0,
+                    id: "r1-c1",
+                },
+                Cell {
+                    y: 99.7,
+                    x: 150.0,
+                    id: "r1-c2",
+                },
+                Cell {
+                    y: 100.2,
+                    x: 250.0,
+                    id: "r1-c3",
+                },
+                Cell {
+                    y: 86.4,
+                    x: 50.0,
+                    id: "r2-c1",
+                },
+                Cell {
+                    y: 85.8,
+                    x: 150.0,
+                    id: "r2-c2",
+                },
+                Cell {
+                    y: 86.1,
+                    x: 250.0,
+                    id: "r2-c3",
+                },
+            ];
+            cells.sort_by(|a, b| row_aware_span_cmp(a.y, a.x, b.y, b.x));
+            let order: Vec<&str> = cells.iter().map(|c| c.id).collect();
+            assert_eq!(
+                order,
+                vec!["r1-c1", "r1-c2", "r1-c3", "r2-c1", "r2-c2", "r2-c3"],
+                "cells from the same row must stay contiguous and X-sorted"
+            );
+        }
+
+        /// Row-aware comparator must still put distinct-leading rows in
+        /// top-to-bottom reading order.
+        #[test]
+        fn test_row_aware_span_cmp_distinct_rows_descending() {
+            let mut rows = [
+                (100.0f32, 0.0f32, "top"),
+                (50.0, 0.0, "middle"),
+                (10.0, 0.0, "bottom"),
+            ];
+            rows.sort_by(|a, b| row_aware_span_cmp(a.0, a.1, b.0, b.1));
+            assert_eq!(rows[0].2, "top");
+            assert_eq!(rows[1].2, "middle");
+            assert_eq!(rows[2].2, "bottom");
+        }
+
+        /// The comparator is used by sort_by, which requires a valid total
+        /// order. Run a randomized stress test to confirm no transitivity
+        /// panics.
+        #[test]
+        fn test_row_aware_span_cmp_is_total_order() {
+            let mut v: Vec<(f32, f32)> = (0..200)
+                .map(|i| ((i as f32) * 0.73, ((i * 17) % 500) as f32))
+                .collect();
+            v.sort_by(|a, b| row_aware_span_cmp(a.0, a.1, b.0, b.1));
+        }
+
         /// Sort a large array with mixed NaN/normal values to stress-test.
         #[test]
         fn test_sort_stress_with_nan() {
@@ -369,6 +543,37 @@ pub(crate) mod utils {
             }
             // Must not panic
             values.sort_by(|a, b| safe_float_cmp(*a, *b));
+        }
+
+        #[test]
+        fn test_safe_prefix_ascii() {
+            assert_eq!(safe_prefix("hello", 3), "hel");
+            assert_eq!(safe_prefix("hello", 10), "hello");
+            assert_eq!(safe_prefix("", 5), "");
+            assert_eq!(safe_prefix("hi", 0), "");
+        }
+
+        #[test]
+        fn test_safe_prefix_multibyte() {
+            let text = "✚✳★✵"; // 4 × 3-byte chars = 12 bytes
+            assert_eq!(safe_prefix(text, 10), "✚✳★"); // rounds down from 10 to 9
+            assert_eq!(safe_prefix(text, 9), "✚✳★"); // exact boundary
+            assert_eq!(safe_prefix(text, 12), "✚✳★✵"); // full string
+        }
+
+        #[test]
+        fn test_safe_suffix_ascii() {
+            assert_eq!(safe_suffix("hello", 3), "llo");
+            assert_eq!(safe_suffix("hello", 10), "hello");
+            assert_eq!(safe_suffix("", 5), "");
+            assert_eq!(safe_suffix("hi", 0), "");
+        }
+
+        #[test]
+        fn test_safe_suffix_multibyte() {
+            let text = "AB✚✳★✵"; // 14 bytes: A(0) B(1) ✚(2..5) ✳(5..8) ★(8..11) ✵(11..14)
+                                 // 14 - 10 = 4, byte 4 is inside ✚ → rounds up to 5
+            assert_eq!(safe_suffix(text, 10), "✳★✵");
         }
     }
 }

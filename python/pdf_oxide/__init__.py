@@ -42,6 +42,11 @@ pdf.save("output.pdf")
 Dual-licensed under MIT OR Apache-2.0.
 """
 
+from ._async import (
+    AsyncOfficeConverter,
+    AsyncPdf,
+    AsyncPdfDocument,
+)
 from .pdf_oxide import (
     VERSION,
     # Page Templates
@@ -51,8 +56,11 @@ from .pdf_oxide import (
     # Advanced Graphics
     Color,
     ExtGState,
+    # Extraction
+    ExtractionProfile,
     Footer,
     Header,
+    LayoutParams,
     LinearGradient,
     LineCap,
     LineJoin,
@@ -67,13 +75,19 @@ from .pdf_oxide import (
     Pdf,
     PdfDocument,
     RadialGradient,
-    # Extraction
     TextSpan,
+    disable_logging,
+    get_log_level,
+    set_log_level,
+    setup_logging,
 )
 
 
 __all__ = [
     "PdfDocument",
+    "AsyncPdfDocument",
+    "AsyncPdf",
+    "AsyncOfficeConverter",
     "VERSION",
     # PDF Creation
     "Pdf",
@@ -93,11 +107,18 @@ __all__ = [
     "Footer",
     "PageTemplate",
     # Extraction
+    "ExtractionProfile",
+    "LayoutParams",
     "TextSpan",
     # OCR
     "OcrEngine",
     "OcrConfig",
     # Office
     "OfficeConverter",
+    # Logging
+    "setup_logging",
+    "set_log_level",
+    "get_log_level",
+    "disable_logging",
 ]
 __version__ = VERSION

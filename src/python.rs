@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use pyo3::exceptions::{PyIOError, PyRuntimeError};
+use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
 use pyo3::types::PyBytes;
@@ -28,7 +28,7 @@ use crate::writer::{BlendMode as RustBlendMode, LineCap as RustLineCap, LineJoin
 /// Python wrapper for PdfDocument.
 ///
 /// Provides PDF parsing, text extraction, and format conversion capabilities.
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfDocument", unsendable)]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfDocument")]
 pub struct PyPdfDocument {
     pub(crate) inner: RustPdfDocument,
     pub(crate) path: Option<String>,
@@ -60,12 +60,22 @@ impl PyPdfDocument {
 impl PyPdfDocument {
     /// Open a PDF file.
     ///
+    /// Open a PDF file, optionally with a password for encrypted documents.
+    ///
     /// Args:
     ///     path (str | pathlib.Path): Path to the PDF file
+    ///     password (str, optional): Password for encrypted PDFs
     #[new]
-    fn new(path: PathBuf) -> PyResult<Self> {
-        let doc = RustPdfDocument::open(&path)
+    #[pyo3(signature = (path, password=None))]
+    #[allow(unused_mut)]
+    fn new(path: PathBuf, password: Option<&str>) -> PyResult<Self> {
+        let mut doc = RustPdfDocument::open(&path)
             .map_err(|e| PyIOError::new_err(format!("Failed to open PDF: {}", e)))?;
+
+        if let Some(pw) = password {
+            doc.authenticate(pw.as_bytes())
+                .map_err(|e| PyRuntimeError::new_err(format!("Authentication failed: {}", e)))?;
+        }
 
         let path_str = path.to_string_lossy().into_owned();
         Ok(PyPdfDocument {
@@ -76,12 +86,19 @@ impl PyPdfDocument {
         })
     }
 
-    /// Open a PDF from bytes.
+    /// Open a PDF from bytes, optionally with a password.
     #[staticmethod]
-    fn from_bytes(data: &Bound<'_, PyBytes>) -> PyResult<Self> {
+    #[pyo3(signature = (data, password=None))]
+    #[allow(unused_mut)]
+    fn from_bytes(data: &Bound<'_, PyBytes>, password: Option<&str>) -> PyResult<Self> {
         let bytes = data.as_bytes().to_vec();
-        let doc = RustPdfDocument::from_bytes(bytes.clone())
+        let mut doc = RustPdfDocument::from_bytes(bytes.clone())
             .map_err(|e| PyIOError::new_err(format!("Failed to open PDF from bytes: {}", e)))?;
+
+        if let Some(pw) = password {
+            doc.authenticate(pw.as_bytes())
+                .map_err(|e| PyRuntimeError::new_err(format!("Authentication failed: {}", e)))?;
+        }
 
         Ok(PyPdfDocument {
             inner: doc,
@@ -306,47 +323,114 @@ impl PyPdfDocument {
     }
 
     /// Extract words.
-    #[pyo3(signature = (page, region=None))]
+    ///
+    /// Args:
+    ///     page (int): Page index (0-based)
+    ///     region (tuple, optional): (x, y, width, height) to filter by
+    ///     word_gap_threshold (float, optional): Override for the horizontal gap
+    ///         (in PDF points) used to split characters into words. Smaller values
+    ///         produce more words.
+    ///     profile (ExtractionProfile, optional): Pre-tuned extraction profile
+    ///         that controls how raw text is parsed from the PDF content stream.
+    #[pyo3(signature = (page, region=None, word_gap_threshold=None, profile=None))]
     fn extract_words(
         &mut self,
         page: usize,
         region: Option<(f32, f32, f32, f32)>,
+        word_gap_threshold: Option<f32>,
+        profile: Option<PyExtractionProfile>,
     ) -> PyResult<Vec<PyWord>> {
-        let words_result = if let Some((x, y, w, h)) = region {
-            self.inner.extract_words_in_rect(
-                page,
-                crate::geometry::Rect::new(x, y, w, h),
-                crate::layout::RectFilterMode::Intersects,
-            )
+        use crate::layout::{RectFilterMode, SpatialCollectionFiltering};
+
+        let words = self
+            .inner
+            .extract_words_with_thresholds(page, word_gap_threshold, profile.map(|p| p.inner))
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to extract words: {}", e)))?;
+
+        let filtered = if let Some((x, y, w, h)) = region {
+            let rect = crate::geometry::Rect::new(x, y, w, h);
+            words.filter_by_rect(&rect, RectFilterMode::Intersects)
         } else {
-            self.inner.extract_words(page)
+            words
         };
 
-        words_result
-            .map(|words| words.into_iter().map(|w| PyWord { inner: w }).collect())
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to extract words: {}", e)))
+        Ok(filtered.into_iter().map(|w| PyWord { inner: w }).collect())
     }
 
     /// Extract text lines.
-    #[pyo3(signature = (page, region=None))]
+    ///
+    /// Args:
+    ///     page (int): Page index (0-based)
+    ///     region (tuple, optional): (x, y, width, height) to filter by
+    ///     word_gap_threshold (float, optional): Override for the horizontal gap
+    ///         (in PDF points) used to split characters into words.
+    ///     line_gap_threshold (float, optional): Override for the vertical gap
+    ///         (in PDF points) used to group words into lines.
+    ///     profile (ExtractionProfile, optional): Pre-tuned extraction profile
+    ///         that controls how raw text is parsed from the PDF content stream.
+    #[pyo3(signature = (page, region=None, word_gap_threshold=None, line_gap_threshold=None, profile=None))]
     fn extract_text_lines(
         &mut self,
         page: usize,
         region: Option<(f32, f32, f32, f32)>,
+        word_gap_threshold: Option<f32>,
+        line_gap_threshold: Option<f32>,
+        profile: Option<PyExtractionProfile>,
     ) -> PyResult<Vec<PyTextLine>> {
-        let lines_result = if let Some((x, y, w, h)) = region {
-            self.inner.extract_text_lines_in_rect(
+        use crate::layout::{RectFilterMode, SpatialCollectionFiltering};
+
+        let lines = self
+            .inner
+            .extract_text_lines_with_thresholds(
                 page,
-                crate::geometry::Rect::new(x, y, w, h),
-                crate::layout::RectFilterMode::Intersects,
+                word_gap_threshold,
+                line_gap_threshold,
+                profile.map(|p| p.inner),
             )
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to extract lines: {}", e)))?;
+
+        let filtered = if let Some((x, y, w, h)) = region {
+            let rect = crate::geometry::Rect::new(x, y, w, h);
+            lines.filter_by_rect(&rect, RectFilterMode::Intersects)
         } else {
-            self.inner.extract_text_lines(page)
+            lines
         };
 
-        lines_result
-            .map(|lines| lines.into_iter().map(|l| PyTextLine { inner: l }).collect())
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to extract lines: {}", e)))
+        Ok(filtered
+            .into_iter()
+            .map(|l| PyTextLine { inner: l })
+            .collect())
+    }
+
+    /// Get the computed adaptive layout parameters for a page.
+    fn page_layout_params(&mut self, page: usize) -> PyResult<PyLayoutParams> {
+        use crate::layout::{AdaptiveLayoutParams, DocumentProperties};
+
+        let spans = self
+            .inner
+            .extract_spans(page)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to extract spans: {}", e)))?;
+
+        let media_box = self
+            .inner
+            .get_page_media_box(page)
+            .unwrap_or((0.0, 0.0, 612.0, 792.0));
+        let page_bbox =
+            crate::geometry::Rect::new(media_box.0, media_box.1, media_box.2, media_box.3);
+
+        let all_chars: Vec<_> = spans.iter().flat_map(|s| s.to_chars()).collect();
+        let props = DocumentProperties::analyze(&all_chars, page_bbox)
+            .map_err(|e| PyRuntimeError::new_err(format!("Layout analysis failed: {}", e)))?;
+        let params = AdaptiveLayoutParams::from_properties(&props);
+
+        Ok(PyLayoutParams {
+            word_gap_threshold: params.word_gap_threshold,
+            line_gap_threshold: params.line_gap_threshold,
+            median_char_width: props.median_char_width,
+            median_font_size: props.median_font_size,
+            median_line_spacing: props.median_line_spacing,
+            column_count: props.column_count,
+        })
     }
 
     /// Check if Tagged PDF.
@@ -355,7 +439,7 @@ impl PyPdfDocument {
     }
 
     /// Convert page to plain text.
-    #[pyo3(signature = (page, preserve_layout=false, detect_headings=true, include_images=true, image_output_dir=None))]
+    #[pyo3(signature = (page, preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None))]
     fn to_plain_text(
         &mut self,
         page: usize,
@@ -367,7 +451,7 @@ impl PyPdfDocument {
         let options = RustConversionOptions {
             preserve_layout,
             detect_headings,
-            extract_tables: false,
+            extract_tables: true,
             include_images,
             image_output_dir,
             ..Default::default()
@@ -379,7 +463,7 @@ impl PyPdfDocument {
     }
 
     /// Convert all pages to plain text.
-    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=true, image_output_dir=None))]
+    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None))]
     fn to_plain_text_all(
         &mut self,
         preserve_layout: bool,
@@ -390,7 +474,7 @@ impl PyPdfDocument {
         let options = RustConversionOptions {
             preserve_layout,
             detect_headings,
-            extract_tables: false,
+            extract_tables: true,
             include_images,
             image_output_dir,
             ..Default::default()
@@ -402,7 +486,7 @@ impl PyPdfDocument {
     }
 
     /// Convert page to Markdown.
-    #[pyo3(signature = (page, preserve_layout=false, detect_headings=true, include_images=true, image_output_dir=None, embed_images=true, include_form_fields=true))]
+    #[pyo3(signature = (page, preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None, embed_images=true, include_form_fields=true))]
     fn to_markdown(
         &mut self,
         page: usize,
@@ -430,7 +514,7 @@ impl PyPdfDocument {
     }
 
     /// Convert page to HTML.
-    #[pyo3(signature = (page, preserve_layout=false, detect_headings=true, include_images=true, image_output_dir=None, embed_images=true, include_form_fields=true))]
+    #[pyo3(signature = (page, preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None, embed_images=true, include_form_fields=true))]
     fn to_html(
         &mut self,
         page: usize,
@@ -458,7 +542,7 @@ impl PyPdfDocument {
     }
 
     /// Convert all pages to Markdown.
-    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=true, image_output_dir=None, embed_images=true, include_form_fields=true))]
+    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None, embed_images=true, include_form_fields=true))]
     fn to_markdown_all(
         &mut self,
         preserve_layout: bool,
@@ -485,7 +569,7 @@ impl PyPdfDocument {
     }
 
     /// Convert all pages to HTML.
-    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=true, image_output_dir=None, embed_images=true, include_form_fields=true))]
+    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None, embed_images=true, include_form_fields=true))]
     fn to_html_all(
         &mut self,
         preserve_layout: bool,
@@ -514,7 +598,9 @@ impl PyPdfDocument {
     /// Get page object for DOM access.
     fn page(&mut self, index: usize) -> PyResult<PyPdfPage> {
         self.ensure_editor()?;
-        let editor = self.editor.as_mut().unwrap();
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
         let page = editor
             .get_page(index)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to get page: {}", e)))?;
@@ -524,7 +610,9 @@ impl PyPdfDocument {
     /// Save modification to page.
     fn save_page(&mut self, page: &PyPdfPage) -> PyResult<()> {
         self.ensure_editor()?;
-        let editor = self.editor.as_mut().unwrap();
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
         editor
             .save_page(page.inner.clone())
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to save page: {}", e)))
@@ -1117,12 +1205,30 @@ impl PyPdfDocument {
     }
 
     /// Extract text spans.
-    #[pyo3(signature = (page, region=None))]
+    ///
+    /// Args:
+    ///     page: Zero-based page index.
+    ///     region: Optional (x, y, w, h) bounding box to restrict extraction.
+    ///     reading_order: Optional reading order strategy. One of "top_to_bottom"
+    ///         (default) or "column_aware" (XY-Cut column detection).
+    #[pyo3(signature = (page, region=None, reading_order=None))]
     fn extract_spans(
         &mut self,
         page: usize,
         region: Option<(f32, f32, f32, f32)>,
+        reading_order: Option<&str>,
     ) -> PyResult<Vec<PyTextSpan>> {
+        let order = match reading_order {
+            Some("column_aware") => crate::document::ReadingOrder::ColumnAware,
+            Some("top_to_bottom") | None => crate::document::ReadingOrder::TopToBottom,
+            Some(other) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Unknown reading_order '{}'. Expected 'top_to_bottom' or 'column_aware'.",
+                    other
+                )));
+            },
+        };
+
         let res = if let Some(r) = region {
             self.inner.extract_spans_in_rect(
                 page,
@@ -1130,10 +1236,69 @@ impl PyPdfDocument {
                 crate::layout::RectFilterMode::Intersects,
             )
         } else {
-            self.inner.extract_spans(page)
+            self.inner.extract_spans_with_reading_order(page, order)
         };
         res.map(|spans| spans.into_iter().map(|s| PyTextSpan { inner: s }).collect())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Extract complete page text data in a single call.
+    ///
+    /// Returns a dict with spans, per-character data, and page dimensions.
+    /// The chars are derived from spans using font-metric widths when available.
+    ///
+    /// Args:
+    ///     page (int): Zero-based page index.
+    ///     reading_order (str, optional): Reading order strategy. One of
+    ///         "top_to_bottom" (default) or "column_aware".
+    ///
+    /// Returns:
+    ///     dict: ``{"spans": [...], "chars": [...], "page_width": float, "page_height": float}``
+    #[pyo3(signature = (page, reading_order=None))]
+    fn extract_page_text(
+        &mut self,
+        py: Python<'_>,
+        page: usize,
+        reading_order: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let order = match reading_order {
+            Some("column_aware") => crate::document::ReadingOrder::ColumnAware,
+            Some("top_to_bottom") | None => crate::document::ReadingOrder::TopToBottom,
+            Some(other) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Unknown reading_order '{}'. Expected 'top_to_bottom' or 'column_aware'.",
+                    other
+                )));
+            },
+        };
+
+        let page_text = self
+            .inner
+            .extract_page_text_with_options(page, order)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let dict = pyo3::types::PyDict::new(py);
+
+        // Spans as list of PyTextSpan
+        let spans_list: Vec<PyTextSpan> = page_text
+            .spans
+            .into_iter()
+            .map(|s| PyTextSpan { inner: s })
+            .collect();
+        dict.set_item("spans", spans_list)?;
+
+        // Chars as list of PyTextChar
+        let chars_list: Vec<PyTextChar> = page_text
+            .chars
+            .into_iter()
+            .map(|ch| PyTextChar { inner: ch })
+            .collect();
+        dict.set_item("chars", chars_list)?;
+
+        dict.set_item("page_width", page_text.page_width)?;
+        dict.set_item("page_height", page_text.page_height)?;
+
+        Ok(dict.into())
     }
 
     /// Get document outline.
@@ -1311,7 +1476,9 @@ impl PyPdfDocument {
     /// Get specific form field value.
     fn get_form_field_value(&mut self, name: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.ensure_editor()?;
-        let editor = self.editor.as_mut().unwrap();
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
         let value = editor
             .get_form_field_value(name)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1324,7 +1491,9 @@ impl PyPdfDocument {
     /// Set form field value.
     fn set_form_field_value(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
         self.ensure_editor()?;
-        let editor = self.editor.as_mut().unwrap();
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
         let field_value = python_to_form_field_value(value)?;
         editor
             .set_form_field_value(name, field_value)
@@ -1341,7 +1510,9 @@ impl PyPdfDocument {
     #[pyo3(signature = (path, format="fdf"))]
     fn export_form_data(&mut self, path: &str, format: &str) -> PyResult<()> {
         self.ensure_editor()?;
-        let editor = self.editor.as_mut().unwrap();
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
         match format {
             "fdf" => editor
                 .export_form_data_fdf(path)
@@ -1399,7 +1570,9 @@ impl PyPdfDocument {
     /// Merge from source.
     fn merge_from(&mut self, source: &Bound<'_, PyAny>) -> PyResult<usize> {
         self.ensure_editor()?;
-        let editor = self.editor.as_mut().unwrap();
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
         if let Ok(path) = source.extract::<String>() {
             editor
                 .merge_from(&path)
@@ -1489,13 +1662,400 @@ impl PyPdfDocument {
         }
     }
 
+    // ==========================================
+    // Validation — PDF/A, PDF/UA, PDF/X
+    // ==========================================
+
+    /// Validate PDF/A compliance.
+    /// Returns a dict with 'valid', 'level', 'errors', 'warnings' keys.
+    #[pyo3(signature = (level="1b"))]
+    fn validate_pdf_a(&mut self, py: Python<'_>, level: &str) -> PyResult<Py<PyAny>> {
+        use crate::compliance::pdf_a::validate_pdf_a;
+        use crate::compliance::types::PdfALevel;
+        let pdf_level = match level {
+            "1a" => PdfALevel::A1a,
+            "1b" => PdfALevel::A1b,
+            "2a" => PdfALevel::A2a,
+            "2b" => PdfALevel::A2b,
+            "2u" => PdfALevel::A2u,
+            "3a" => PdfALevel::A3a,
+            "3b" => PdfALevel::A3b,
+            "3u" => PdfALevel::A3u,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown PDF/A level: '{}'. Use 1a, 1b, 2a, 2b, 2u, 3a, 3b, 3u",
+                    level
+                )))
+            },
+        };
+        let result = validate_pdf_a(&mut self.inner, pdf_level)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("valid", result.errors.is_empty())?;
+        d.set_item("level", level)?;
+        let errors: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
+        let warnings: Vec<String> = result.warnings.iter().map(|w| w.to_string()).collect();
+        d.set_item("errors", errors)?;
+        d.set_item("warnings", warnings)?;
+        Ok(d.into())
+    }
+
+    /// Validate PDF/UA accessibility compliance.
+    /// Returns a dict with 'valid', 'errors', 'warnings' keys.
+    fn validate_pdf_ua(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        use crate::compliance::pdf_ua::validate_pdf_ua;
+        let result = validate_pdf_ua(&mut self.inner, crate::compliance::pdf_ua::PdfUaLevel::Ua1)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("valid", result.errors.is_empty())?;
+        let errors: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
+        let warnings: Vec<String> = result.warnings.iter().map(|w| w.to_string()).collect();
+        d.set_item("errors", errors)?;
+        d.set_item("warnings", warnings)?;
+        Ok(d.into())
+    }
+
+    /// Validate PDF/X print compliance.
+    /// Returns a dict with 'valid', 'level', 'errors', 'warnings' keys.
+    #[pyo3(signature = (level="1a_2001"))]
+    fn validate_pdf_x(&mut self, py: Python<'_>, level: &str) -> PyResult<Py<PyAny>> {
+        use crate::compliance::pdf_x::types::PdfXLevel;
+        use crate::compliance::pdf_x::validator::validate_pdf_x;
+        let pdf_level = match level {
+            "1a_2001" => PdfXLevel::X1a2001,
+            "3_2002" => PdfXLevel::X32002,
+            "4" => PdfXLevel::X4,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown PDF/X level: '{}'. Use 1a_2001, 3_2002, 4",
+                    level
+                )))
+            },
+        };
+        let result = validate_pdf_x(&mut self.inner, pdf_level)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("valid", result.errors.is_empty())?;
+        d.set_item("level", level)?;
+        let errors: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
+        let warnings: Vec<String> = result.warnings.iter().map(|w| w.to_string()).collect();
+        d.set_item("errors", errors)?;
+        d.set_item("warnings", warnings)?;
+        Ok(d.into())
+    }
+
+    // ==========================================
+    // Page Operations — extract, delete, move
+    // ==========================================
+
+    /// Extract page range to a new PDF file.
+    /// `pages` is a list of 0-based page indices.
+    fn extract_pages(&mut self, pages: Vec<usize>, output: &str) -> PyResult<()> {
+        self.ensure_editor()?;
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
+        editor
+            .extract_pages(&pages, output)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Delete a page by index (0-based).
+    fn delete_page(&mut self, index: usize) -> PyResult<()> {
+        use crate::editor::EditableDocument;
+        self.ensure_editor()?;
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
+        editor
+            .remove_page(index)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Move a page from one position to another (0-based indices).
+    fn move_page(&mut self, from_index: usize, to_index: usize) -> PyResult<()> {
+        use crate::editor::EditableDocument;
+        self.ensure_editor()?;
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
+        editor
+            .move_page(from_index, to_index)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Create a flattened PDF where each page is rendered as an image.
+    /// This "burns in" all annotations, form fields, and overlays into
+    /// a flat raster representation. Useful for redaction, archival,
+    /// or ensuring consistent visual output across viewers.
+    ///
+    /// Returns the flattened PDF as bytes.
+    #[pyo3(signature = (dpi=150))]
+    fn flatten_to_images(&mut self, py: Python<'_>, dpi: u32) -> PyResult<Py<PyBytes>> {
+        #[cfg(feature = "rendering")]
+        {
+            let bytes = crate::rendering::flatten_to_images(&mut self.inner, dpi)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(PyBytes::new(py, &bytes).unbind())
+        }
+        #[cfg(not(feature = "rendering"))]
+        {
+            Err(PyRuntimeError::new_err("Rendering feature not enabled"))
+        }
+    }
+
+    fn __len__(&mut self) -> PyResult<usize> {
+        self.page_count()
+    }
+
+    fn __getitem__(slf: Py<Self>, py: Python<'_>, index: isize) -> PyResult<PyDocPage> {
+        let count = slf.borrow_mut(py).page_count()? as isize;
+        let idx = if index < 0 { count + index } else { index };
+        if idx < 0 || idx >= count {
+            return Err(pyo3::exceptions::PyIndexError::new_err("page index out of range"));
+        }
+        Ok(PyDocPage {
+            doc: slf,
+            page_index: idx as usize,
+        })
+    }
+
+    fn __iter__(slf: Py<Self>, py: Python<'_>) -> PyResult<PyDocPageIter> {
+        let count = slf.borrow_mut(py).page_count()?;
+        Ok(PyDocPageIter {
+            doc: slf,
+            index: 0,
+            count,
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!("PdfDocument(version={}.{})", self.inner.version().0, self.inner.version().1)
     }
 }
 
+/// Iterator over pages of a PdfDocument.
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfDocumentIter")]
+pub struct PyDocPageIter {
+    doc: Py<PyPdfDocument>,
+    index: usize,
+    count: usize,
+}
+
+#[pymethods]
+impl PyDocPageIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> Option<PyDocPage> {
+        if self.index >= self.count {
+            return None;
+        }
+        let page = PyDocPage {
+            doc: self.doc.clone_ref(py),
+            page_index: self.index,
+        };
+        self.index += 1;
+        Some(page)
+    }
+}
+
+/// A single page of a PdfDocument, providing lazy access to all page-level operations.
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Page", subclass)]
+pub struct PyDocPage {
+    doc: Py<PyPdfDocument>,
+    page_index: usize,
+}
+
+#[pymethods]
+impl PyDocPage {
+    #[getter]
+    fn index(&self) -> usize {
+        self.page_index
+    }
+
+    #[getter]
+    fn bbox(&self, py: Python<'_>) -> PyResult<(f32, f32, f32, f32)> {
+        self.doc
+            .borrow_mut(py)
+            .inner
+            .get_page_media_box(self.page_index)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[getter]
+    fn width(&self, py: Python<'_>) -> PyResult<f32> {
+        self.bbox(py).map(|(llx, _, urx, _)| urx - llx)
+    }
+
+    #[getter]
+    fn height(&self, py: Python<'_>) -> PyResult<f32> {
+        self.bbox(py).map(|(_, lly, _, ury)| ury - lly)
+    }
+
+    #[getter]
+    fn text(&self, py: Python<'_>) -> PyResult<String> {
+        self.doc.borrow_mut(py).extract_text(self.page_index, None)
+    }
+
+    #[getter]
+    fn chars(&self, py: Python<'_>) -> PyResult<Vec<PyTextChar>> {
+        self.doc.borrow_mut(py).extract_chars(self.page_index, None)
+    }
+
+    #[getter]
+    fn words(&self, py: Python<'_>) -> PyResult<Vec<PyWord>> {
+        self.doc
+            .borrow_mut(py)
+            .extract_words(self.page_index, None, None, None)
+    }
+
+    #[getter]
+    fn lines(&self, py: Python<'_>) -> PyResult<Vec<PyTextLine>> {
+        self.doc
+            .borrow_mut(py)
+            .extract_text_lines(self.page_index, None, None, None, None)
+    }
+
+    #[getter]
+    fn spans(&self, py: Python<'_>) -> PyResult<Vec<PyTextSpan>> {
+        self.doc
+            .borrow_mut(py)
+            .extract_spans(self.page_index, None, None)
+    }
+
+    #[getter]
+    fn tables(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.doc
+            .borrow_mut(py)
+            .extract_tables(py, self.page_index, None, None)
+    }
+
+    #[getter]
+    fn images(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.doc
+            .borrow_mut(py)
+            .extract_images(py, self.page_index, None)
+    }
+
+    #[getter]
+    fn annotations(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.doc.borrow_mut(py).get_annotations(py, self.page_index)
+    }
+
+    #[getter]
+    fn paths(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.doc
+            .borrow_mut(py)
+            .extract_paths(py, self.page_index, None)
+    }
+
+    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None, embed_images=true, include_form_fields=true))]
+    fn markdown(
+        &self,
+        py: Python<'_>,
+        preserve_layout: bool,
+        detect_headings: bool,
+        include_images: bool,
+        image_output_dir: Option<String>,
+        embed_images: bool,
+        include_form_fields: bool,
+    ) -> PyResult<String> {
+        self.doc.borrow_mut(py).to_markdown(
+            self.page_index,
+            preserve_layout,
+            detect_headings,
+            include_images,
+            image_output_dir,
+            embed_images,
+            include_form_fields,
+        )
+    }
+
+    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None))]
+    fn plain_text(
+        &self,
+        py: Python<'_>,
+        preserve_layout: bool,
+        detect_headings: bool,
+        include_images: bool,
+        image_output_dir: Option<String>,
+    ) -> PyResult<String> {
+        self.doc.borrow_mut(py).to_plain_text(
+            self.page_index,
+            preserve_layout,
+            detect_headings,
+            include_images,
+            image_output_dir,
+        )
+    }
+
+    #[pyo3(signature = (preserve_layout=false, detect_headings=true, include_images=false, image_output_dir=None, embed_images=true, include_form_fields=true))]
+    fn html(
+        &self,
+        py: Python<'_>,
+        preserve_layout: bool,
+        detect_headings: bool,
+        include_images: bool,
+        image_output_dir: Option<String>,
+        embed_images: bool,
+        include_form_fields: bool,
+    ) -> PyResult<String> {
+        self.doc.borrow_mut(py).to_html(
+            self.page_index,
+            preserve_layout,
+            detect_headings,
+            include_images,
+            image_output_dir,
+            embed_images,
+            include_form_fields,
+        )
+    }
+
+    #[pyo3(signature = (dpi=None, format=None))]
+    fn render(&self, py: Python<'_>, dpi: Option<u32>, format: Option<&str>) -> PyResult<Vec<u8>> {
+        self.doc
+            .borrow_mut(py)
+            .render_page(self.page_index, dpi, format)
+    }
+
+    #[pyo3(signature = (pattern, case_insensitive=false, literal=false, whole_word=false, max_results=100))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        pattern: &str,
+        case_insensitive: bool,
+        literal: bool,
+        whole_word: bool,
+        max_results: usize,
+    ) -> PyResult<Py<PyAny>> {
+        self.doc.borrow_mut(py).search_page(
+            py,
+            self.page_index,
+            pattern,
+            case_insensitive,
+            literal,
+            whole_word,
+            max_results,
+        )
+    }
+
+    fn region(&self, py: Python<'_>, x: f32, y: f32, width: f32, height: f32) -> PyPdfPageRegion {
+        PyPdfPageRegion {
+            doc: self.doc.clone_ref(py),
+            page_index: self.page_index,
+            region: crate::geometry::Rect::new(x, y, width, height),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Page(index={})", self.page_index)
+    }
+}
+
 /// A form field extracted from a PDF AcroForm.
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "FormField", unsendable)]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "FormField")]
 pub struct PyFormField {
     inner: RustFormField,
 }
@@ -1596,7 +2156,7 @@ fn python_to_form_field_value(
 }
 
 /// Python wrapper for PDF creation.
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Pdf")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Pdf", skip_from_py_object)]
 pub struct PyPdf {
     bytes: Vec<u8>,
 }
@@ -1716,6 +2276,37 @@ impl PyPdf {
         })
     }
 
+    /// Open an existing PDF from bytes.
+    ///
+    /// Args:
+    ///     data (bytes): PDF file contents
+    ///
+    /// Returns:
+    ///     Pdf: A Pdf object for editing
+    #[staticmethod]
+    fn from_bytes(data: &Bound<'_, PyBytes>) -> PyResult<Self> {
+        let mut pdf = crate::api::Pdf::from_bytes(data.as_bytes().to_vec())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let bytes = pdf
+            .save_to_bytes()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyPdf { bytes })
+    }
+
+    /// Merge multiple PDF files into one.
+    ///
+    /// Args:
+    ///     paths (list[str]): List of paths to PDF files to merge
+    ///
+    /// Returns:
+    ///     Pdf: A new PDF containing all pages from the input files
+    #[staticmethod]
+    fn merge(paths: Vec<String>) -> PyResult<Self> {
+        let bytes =
+            crate::api::merge_pdfs(&paths).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyPdf { bytes })
+    }
+
     fn __len__(&self) -> usize {
         self.bytes.len()
     }
@@ -1728,11 +2319,19 @@ impl PyPdf {
 use crate::converters::office::OfficeConverter as RustOfficeConverter;
 
 #[cfg(feature = "office")]
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "OfficeConverter")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "OfficeConverter",
+    skip_from_py_object
+)]
 pub struct PyOfficeConverter;
 
 #[cfg(not(feature = "office"))]
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "OfficeConverter")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "OfficeConverter",
+    skip_from_py_object
+)]
 pub struct PyOfficeConverter;
 
 #[cfg(not(feature = "office"))]
@@ -1779,6 +2378,10 @@ impl PyOfficeConverter {
 #[cfg(feature = "office")]
 #[pymethods]
 impl PyOfficeConverter {
+    #[new]
+    fn new() -> Self {
+        PyOfficeConverter
+    }
     #[staticmethod]
     fn from_docx(path: &str) -> PyResult<PyPdf> {
         let res = RustOfficeConverter::new()
@@ -1832,7 +2435,11 @@ impl PyOfficeConverter {
 
 use crate::editor::{ElementId, PdfElement, PdfPage as RustPdfPage, PdfText as RustPdfText};
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfPageRegion")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "PdfPageRegion",
+    skip_from_py_object
+)]
 pub struct PyPdfPageRegion {
     pub doc: Py<PyPdfDocument>,
     pub page_index: usize,
@@ -1851,11 +2458,11 @@ impl PyPdfPageRegion {
     }
     fn extract_words(&self, py: Python<'_>) -> PyResult<Vec<PyWord>> {
         let mut d = self.doc.bind(py).borrow_mut();
-        d.extract_words(self.page_index, Some(self.bbox()))
+        d.extract_words(self.page_index, Some(self.bbox()), None, None)
     }
     fn extract_text_lines(&self, py: Python<'_>) -> PyResult<Vec<PyTextLine>> {
         let mut d = self.doc.bind(py).borrow_mut();
-        d.extract_text_lines(self.page_index, Some(self.bbox()))
+        d.extract_text_lines(self.page_index, Some(self.bbox()), None, None, None)
     }
     #[pyo3(signature = (table_settings=None))]
     fn extract_tables(
@@ -1887,7 +2494,7 @@ impl PyPdfPageRegion {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfPage", unsendable)]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfPage")]
 pub struct PyPdfPage {
     inner: RustPdfPage,
 }
@@ -2004,7 +2611,11 @@ impl PyPdfPage {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfTextId")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "PdfTextId",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyPdfTextId {
     inner: ElementId,
@@ -2016,7 +2627,7 @@ impl PyPdfTextId {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfText")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfText", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPdfText {
     inner: RustPdfText,
@@ -2072,7 +2683,7 @@ impl PyPdfText {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfImage")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfImage", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPdfImage {
     inner: crate::editor::PdfImage,
@@ -2102,7 +2713,11 @@ impl PyPdfImage {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfAnnotation")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "PdfAnnotation",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyAnnotationWrapper {
     inner: crate::editor::AnnotationWrapper,
@@ -2139,7 +2754,11 @@ impl PyAnnotationWrapper {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfElement")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "PdfElement",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyPdfElement {
     inner: PdfElement,
@@ -2185,7 +2804,7 @@ impl PyPdfElement {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "TextChar")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "TextChar", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyTextChar {
     inner: RustTextChar,
@@ -2222,6 +2841,10 @@ impl PyTextChar {
         self.inner.is_italic
     }
     #[getter]
+    fn is_monospace(&self) -> bool {
+        self.inner.is_monospace
+    }
+    #[getter]
     fn color(&self) -> (f32, f32, f32) {
         (self.inner.color.r, self.inner.color.g, self.inner.color.b)
     }
@@ -2247,7 +2870,7 @@ impl PyTextChar {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "TextSpan")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "TextSpan", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyTextSpan {
     inner: crate::layout::TextSpan,
@@ -2284,12 +2907,20 @@ impl PyTextSpan {
         self.inner.is_italic
     }
     #[getter]
+    fn is_monospace(&self) -> bool {
+        self.inner.is_monospace
+    }
+    #[getter]
+    fn char_widths(&self) -> Vec<f32> {
+        self.inner.char_widths.clone()
+    }
+    #[getter]
     fn color(&self) -> (f32, f32, f32) {
         (self.inner.color.r, self.inner.color.g, self.inner.color.b)
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "TextWord")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "TextWord", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyWord {
     inner: crate::layout::Word,
@@ -2335,7 +2966,7 @@ impl PyWord {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "TextLine")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "TextLine", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyTextLine {
     inner: crate::layout::TextLine,
@@ -2388,6 +3019,46 @@ fn path_to_py_dict(py: Python<'_>, path: &crate::elements::PathContent) -> PyRes
         d.set_item("fill_color", py.None())?;
     }
     d.set_item("operations_count", path.operations.len())?;
+
+    // Expose path operations as list of dicts for vector extraction use cases
+    let ops_list = pyo3::types::PyList::empty(py);
+    for op in &path.operations {
+        let op_dict = pyo3::types::PyDict::new(py);
+        match op {
+            crate::elements::PathOperation::MoveTo(x, y) => {
+                op_dict.set_item("op", "move_to")?;
+                op_dict.set_item("x", *x)?;
+                op_dict.set_item("y", *y)?;
+            },
+            crate::elements::PathOperation::LineTo(x, y) => {
+                op_dict.set_item("op", "line_to")?;
+                op_dict.set_item("x", *x)?;
+                op_dict.set_item("y", *y)?;
+            },
+            crate::elements::PathOperation::CurveTo(cx1, cy1, cx2, cy2, x, y) => {
+                op_dict.set_item("op", "curve_to")?;
+                op_dict.set_item("cx1", *cx1)?;
+                op_dict.set_item("cy1", *cy1)?;
+                op_dict.set_item("cx2", *cx2)?;
+                op_dict.set_item("cy2", *cy2)?;
+                op_dict.set_item("x", *x)?;
+                op_dict.set_item("y", *y)?;
+            },
+            crate::elements::PathOperation::Rectangle(x, y, w, h) => {
+                op_dict.set_item("op", "rectangle")?;
+                op_dict.set_item("x", *x)?;
+                op_dict.set_item("y", *y)?;
+                op_dict.set_item("width", *w)?;
+                op_dict.set_item("height", *h)?;
+            },
+            crate::elements::PathOperation::ClosePath => {
+                op_dict.set_item("op", "close_path")?;
+            },
+        }
+        ops_list.append(op_dict)?;
+    }
+    d.set_item("operations", ops_list)?;
+
     Ok(d.into())
 }
 
@@ -2395,11 +3066,20 @@ fn table_settings_to_config(
     settings: Option<Bound<'_, pyo3::types::PyDict>>,
 ) -> PyResult<crate::structure::spatial_table_detector::TableDetectionConfig> {
     use crate::structure::spatial_table_detector::{TableDetectionConfig, TableStrategy};
-    let mut c = TableDetectionConfig::relaxed();
+    let mut c = TableDetectionConfig::default();
     if let Some(d) = settings {
         if let Some(v) = d.get_item("horizontal_strategy")? {
             let s: String = v.extract()?;
             c.horizontal_strategy = match s.as_str() {
+                "lines" => TableStrategy::Lines,
+                "text" => TableStrategy::Text,
+                "both" => TableStrategy::Both,
+                _ => return Err(PyRuntimeError::new_err("Invalid strategy")),
+            };
+        }
+        if let Some(v) = d.get_item("vertical_strategy")? {
+            let s: String = v.extract()?;
+            c.vertical_strategy = match s.as_str() {
                 "lines" => TableStrategy::Lines,
                 "text" => TableStrategy::Text,
                 "both" => TableStrategy::Both,
@@ -2477,13 +3157,21 @@ impl PyOcrEngine {
 }
 
 #[cfg(feature = "ocr")]
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "OcrConfig")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "OcrConfig",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyOcrConfig {
     inner: crate::ocr::OcrConfig,
 }
 #[cfg(not(feature = "ocr"))]
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "OcrConfig")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "OcrConfig",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyOcrConfig {}
 #[cfg(not(feature = "ocr"))]
@@ -2519,7 +3207,7 @@ impl PyOcrConfig {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Color")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Color", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyColor {
     inner: RustColor,
@@ -2596,7 +3284,11 @@ impl PyColor {
 }
 
 #[allow(dead_code)]
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "BlendMode")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "BlendMode",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyBlendMode {
     inner: RustBlendMode,
@@ -2690,7 +3382,11 @@ impl PyBlendMode {
 }
 
 #[allow(dead_code)]
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "ExtGState")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "ExtGState",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyExtGState {
     fill_alpha: Option<f32>,
@@ -2746,7 +3442,11 @@ impl PyExtGState {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "LinearGradient")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "LinearGradient",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyLinearGradient {
     x1: f32,
@@ -2806,7 +3506,11 @@ impl PyLinearGradient {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "RadialGradient")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "RadialGradient",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyRadialGradient {
     x1: f32,
@@ -2864,7 +3568,7 @@ impl PyRadialGradient {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "LineCap")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "LineCap", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyLineCap {
     pub inner: RustLineCap,
@@ -2906,7 +3610,7 @@ impl PyLineCap {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "LineJoin")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "LineJoin", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyLineJoin {
     pub inner: RustLineJoin,
@@ -2948,7 +3652,11 @@ impl PyLineJoin {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PatternPresets")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "PatternPresets",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyPatternPresets;
 #[pymethods]
@@ -2979,7 +3687,11 @@ impl PyPatternPresets {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "ArtifactStyle")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "ArtifactStyle",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyArtifactStyle {
     pub inner: crate::writer::ArtifactStyle,
@@ -3006,7 +3718,7 @@ impl PyArtifactStyle {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Artifact")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Artifact", from_py_object)]
 #[derive(Clone)]
 pub struct PyArtifact {
     pub inner: crate::writer::Artifact,
@@ -3031,7 +3743,7 @@ impl PyArtifact {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Header")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Header", from_py_object)]
 #[derive(Clone)]
 pub struct PyHeader {
     pub inner: PyArtifact,
@@ -3056,7 +3768,7 @@ impl PyHeader {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Footer")]
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "Footer", from_py_object)]
 #[derive(Clone)]
 pub struct PyFooter {
     pub inner: PyArtifact,
@@ -3081,7 +3793,11 @@ impl PyFooter {
     }
 }
 
-#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PageTemplate")]
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "PageTemplate",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct PyPageTemplate {
     pub inner: crate::writer::PageTemplate,
@@ -3120,8 +3836,285 @@ impl PyPageTemplate {
     }
 }
 
-#[pymodule]
+// pyo3_log caches Python logger levels per target for performance. When
+// users change Python logger configuration (or call `set_log_level`) after
+// the cache has been populated, the cache must be reset for the change to
+// take effect on already-seen targets. We hold the ResetHandle returned by
+// `pyo3_log::try_init()` so both `setup_logging` and `set_log_level` can
+// clear the cache.
+static PYO3_LOG_RESET_HANDLE: std::sync::OnceLock<pyo3_log::ResetHandle> =
+    std::sync::OnceLock::new();
+
+fn init_pyo3_log_handle() {
+    PYO3_LOG_RESET_HANDLE.get_or_init(|| {
+        pyo3_log::try_init().unwrap_or_else(|_| {
+            // Another logger was already installed (e.g. by an embedding
+            // host). In that case, do not replace the global logger;
+            // instead, create a standalone default `Logger` value and take
+            // its `ResetHandle`. `reset_handle()` is available on any
+            // `Logger` instance and does not itself perform installation.
+            pyo3_log::Logger::default().reset_handle()
+        })
+    });
+}
+
+fn reset_pyo3_log_cache() {
+    if let Some(handle) = PYO3_LOG_RESET_HANDLE.get() {
+        handle.reset();
+    }
+}
+
+/// Bridge Rust `log` macros into Python's `logging` module.
+///
+/// After this is called, all log messages emitted by pdf_oxide flow through
+/// Python's standard `logging` module, which is silent by default. Users
+/// control verbosity with the normal Python API, e.g.:
+///
+/// ```python
+/// import logging
+/// logging.basicConfig(level=logging.WARNING)
+/// ```
+///
+/// Called automatically when the `pdf_oxide` module is imported — users do
+/// not need to call it directly. Kept as a public function for backward
+/// compatibility.
+#[pyfunction]
+fn setup_logging() {
+    init_pyo3_log_handle();
+    // Reset the level cache in case Python-side logger config changed since
+    // the last time any target was checked.
+    reset_pyo3_log_cache();
+}
+
+/// Set the maximum log level for pdf_oxide messages that cross into Python.
+///
+/// Accepts one of: `"off"`, `"error"`, `"warn"` / `"warning"`, `"info"`,
+/// `"debug"`, `"trace"`. Case-insensitive.
+///
+/// This sets Rust's `log::max_level` filter gate *and* clears pyo3_log's
+/// per-target level cache so the change takes effect on targets that have
+/// already been logged to. Without the cache reset, loggers like
+/// `pdf_oxide.xref` — which pyo3_log probes and caches on first use — would
+/// keep their stale level and ignore subsequent calls to this function.
+#[pyfunction]
+fn set_log_level(level: &str) -> PyResult<()> {
+    use log::LevelFilter;
+    let filter = match level.to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" => LevelFilter::Off,
+        "error" => LevelFilter::Error,
+        "warn" | "warning" => LevelFilter::Warn,
+        "info" => LevelFilter::Info,
+        "debug" => LevelFilter::Debug,
+        "trace" => LevelFilter::Trace,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid log level '{}': expected off, error, warn, info, debug, or trace",
+                other
+            )));
+        },
+    };
+    log::set_max_level(filter);
+    reset_pyo3_log_cache();
+    Ok(())
+}
+
+/// Disable all pdf_oxide log output — convenience wrapper for
+/// `set_log_level("off")`.
+#[pyfunction]
+fn disable_logging() {
+    log::set_max_level(log::LevelFilter::Off);
+    reset_pyo3_log_cache();
+}
+
+/// Return the current Rust-side log level filter as a lowercase string.
+///
+/// One of: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`.
+///
+/// This mirrors the gate controlled by `set_log_level` and is useful for
+/// tests or context managers that want to save/restore the log level
+/// around a block without hard-coding a "default".
+#[pyfunction]
+fn get_log_level() -> &'static str {
+    match log::max_level() {
+        log::LevelFilter::Off => "off",
+        log::LevelFilter::Error => "error",
+        log::LevelFilter::Warn => "warn",
+        log::LevelFilter::Info => "info",
+        log::LevelFilter::Debug => "debug",
+        log::LevelFilter::Trace => "trace",
+    }
+}
+
+/// Computed adaptive layout parameters for a PDF page.
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "LayoutParams", frozen)]
+pub struct PyLayoutParams {
+    pub word_gap_threshold: f32,
+    pub line_gap_threshold: f32,
+    pub median_char_width: f32,
+    pub median_font_size: f32,
+    pub median_line_spacing: f32,
+    pub column_count: usize,
+}
+
+#[pymethods]
+impl PyLayoutParams {
+    #[getter]
+    fn word_gap_threshold(&self) -> f32 {
+        self.word_gap_threshold
+    }
+    #[getter]
+    fn line_gap_threshold(&self) -> f32 {
+        self.line_gap_threshold
+    }
+    #[getter]
+    fn median_char_width(&self) -> f32 {
+        self.median_char_width
+    }
+    #[getter]
+    fn median_font_size(&self) -> f32 {
+        self.median_font_size
+    }
+    #[getter]
+    fn median_line_spacing(&self) -> f32 {
+        self.median_line_spacing
+    }
+    #[getter]
+    fn column_count(&self) -> usize {
+        self.column_count
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LayoutParams(word_gap={:.2}, line_gap={:.2}, char_width={:.2}, font_size={:.2}, line_spacing={:.2}, columns={})",
+            self.word_gap_threshold,
+            self.line_gap_threshold,
+            self.median_char_width,
+            self.median_font_size,
+            self.median_line_spacing,
+            self.column_count,
+        )
+    }
+}
+
+/// Pre-tuned extraction profile for different document types.
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "ExtractionProfile",
+    frozen,
+    from_py_object
+)]
+#[derive(Clone)]
+pub struct PyExtractionProfile {
+    inner: crate::config::ExtractionProfile,
+}
+
+#[pymethods]
+impl PyExtractionProfile {
+    #[getter]
+    fn name(&self) -> &'static str {
+        self.inner.name
+    }
+    #[getter]
+    fn tj_offset_threshold(&self) -> f32 {
+        self.inner.tj_offset_threshold
+    }
+    #[getter]
+    fn word_margin_ratio(&self) -> f32 {
+        self.inner.word_margin_ratio
+    }
+    #[getter]
+    fn space_threshold_em_ratio(&self) -> f32 {
+        self.inner.space_threshold_em_ratio
+    }
+    #[getter]
+    fn space_char_multiplier(&self) -> f32 {
+        self.inner.space_char_multiplier
+    }
+    #[getter]
+    fn use_adaptive_threshold(&self) -> bool {
+        self.inner.use_adaptive_threshold
+    }
+
+    #[staticmethod]
+    fn conservative() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::CONSERVATIVE,
+        }
+    }
+    #[staticmethod]
+    fn aggressive() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::AGGRESSIVE,
+        }
+    }
+    #[staticmethod]
+    fn balanced() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::BALANCED,
+        }
+    }
+    #[staticmethod]
+    fn academic() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::ACADEMIC,
+        }
+    }
+    #[staticmethod]
+    fn policy() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::POLICY,
+        }
+    }
+    #[staticmethod]
+    fn form() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::FORM,
+        }
+    }
+    #[staticmethod]
+    fn government() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::GOVERNMENT,
+        }
+    }
+    #[staticmethod]
+    fn scanned_ocr() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::SCANNED_OCR,
+        }
+    }
+    #[staticmethod]
+    fn adaptive() -> Self {
+        Self {
+            inner: crate::config::ExtractionProfile::ADAPTIVE,
+        }
+    }
+
+    #[staticmethod]
+    fn available() -> Vec<&'static str> {
+        crate::config::ExtractionProfile::all_profiles().to_vec()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ExtractionProfile('{}', word_margin_ratio={}, tj_offset_threshold={})",
+            self.inner.name, self.inner.word_margin_ratio, self.inner.tj_offset_threshold,
+        )
+    }
+}
+
+#[pymodule(gil_used = false)]
 fn pdf_oxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Bridge Rust `log` to Python `logging` (silent by default, user
+    // configures with `logging.basicConfig(level=...)`). Fixes issue #280.
+    // We hold the ResetHandle so `set_log_level` can flush pyo3_log's
+    // per-target cache — fixes issue #283 regression where per-logger
+    // cached levels survived set_log_level calls.
+    init_pyo3_log_handle();
+    m.add_function(wrap_pyfunction!(setup_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(set_log_level, m)?)?;
+    m.add_function(wrap_pyfunction!(get_log_level, m)?)?;
+    m.add_function(wrap_pyfunction!(disable_logging, m)?)?;
     m.add_class::<PyPdfDocument>()?;
     m.add_class::<PyPdf>()?;
     m.add_class::<PyPdfPage>()?;
@@ -3135,6 +4128,10 @@ fn pdf_oxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWord>()?;
     m.add_class::<PyTextLine>()?;
     m.add_class::<PyPdfPageRegion>()?;
+    m.add_class::<PyDocPage>()?;
+    m.add_class::<PyDocPageIter>()?;
+    m.add_class::<PyLayoutParams>()?;
+    m.add_class::<PyExtractionProfile>()?;
     m.add_class::<PyFormField>()?;
     m.add_class::<PyOcrEngine>()?;
     m.add_class::<PyOcrConfig>()?;

@@ -123,6 +123,7 @@ mod tests {
                 FontWeight::Normal
             },
             is_italic: false,
+            is_monospace: false,
             color: Color::black(),
             mcid: Some(0),
             sequence: 0,
@@ -132,6 +133,7 @@ mod tests {
             word_spacing: 0.0,
             horizontal_scaling: 100.0,
             primary_detected: false,
+            char_widths: vec![],
         }
     }
 
@@ -169,17 +171,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn test_validation_catches_space_bold() {
+    fn test_normalization_prevents_space_bold() {
+        // A space span marked bold in the PDF is normalized to Normal weight
+        // by `from_span`, so `validate_space_formatting` always passes after
+        // normalization -- this is by design (defense-in-depth).
         let spans = vec![
             make_span("hello", true),
-            make_span(" ", true), // Violates PDF spec
+            make_span(" ", true), // Bold in source PDF
             make_span("world", true),
         ];
 
         let normalized = FontWeightNormalizer::normalize_spans(&spans);
+        // Normalization strips bold from space spans:
+        assert_eq!(normalized[1].effective_font_weight, FontWeight::Normal);
+        // So validation always succeeds:
         let result = FontWeightNormalizer::validate_space_formatting(&normalized);
-
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 }
